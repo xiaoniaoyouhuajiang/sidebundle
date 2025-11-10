@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Editor/IDE noise
+.idea/
+.vscode/
+*.swp
+
+# Tooling caches
+/.cargo/
+/.rustup/
+
+# Project-specific: generated bundles, fixtures, etc.
+*.bundle
+*.tgz
+*.tar.gz
+*.log
+
+# Reference material kept outside version control
+/references/

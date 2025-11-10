@@ -1,0 +1,9 @@
+[package]
+name = "sidebundle-closure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sidebundle-core = { path = "../sidebundle-core" }

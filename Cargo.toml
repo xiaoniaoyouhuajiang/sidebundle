@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "sidebundle-cli",
+    "sidebundle-core",
+    "sidebundle-closure",
+    "sidebundle-packager",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
+authors = ["Sidecars Bundler Team"]

@@ -1,0 +1,11 @@
+[package]
+name = "sidebundle-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sidebundle-core = { path = "../sidebundle-core" }
+sidebundle-closure = { path = "../sidebundle-closure" }
+sidebundle-packager = { path = "../sidebundle-packager" }
