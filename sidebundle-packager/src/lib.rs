@@ -199,6 +199,14 @@ LINKER="{linker}"
 BINARY="{binary}"
 LIB_PATH="{lib_path}"
 
+ORIGINAL_LD_LIBRARY_PATH="${{LD_LIBRARY_PATH:-}}"
+if [[ -n "${{ORIGINAL_LD_LIBRARY_PATH}}" ]]; then
+    export LD_LIBRARY_PATH="${{LIB_PATH}}:${{ORIGINAL_LD_LIBRARY_PATH}}"
+else
+    export LD_LIBRARY_PATH="${{LIB_PATH}}"
+fi
+unset LD_PRELOAD
+
 exec "${{LINKER}}" --library-path "${{LIB_PATH}}" "${{BINARY}}" "$@"
 "#,
         linker = linker_ref,
@@ -389,5 +397,7 @@ mod tests {
         let content = render_launcher(&plan);
         assert!(content.contains("payload/bin/echo"));
         assert!(content.contains("--library-path"));
+        assert!(content.contains("LD_LIBRARY_PATH"));
+        assert!(content.contains("unset LD_PRELOAD"));
     }
 }
