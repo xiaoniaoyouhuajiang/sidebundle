@@ -7,3 +7,5 @@ authors.workspace = true
 
 [dependencies]
 sidebundle-core = { path = "../sidebundle-core" }
+log = "0.4"
+thiserror = "1.0"

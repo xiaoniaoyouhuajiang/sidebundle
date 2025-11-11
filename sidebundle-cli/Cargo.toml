@@ -9,3 +9,7 @@ authors.workspace = true
 sidebundle-core = { path = "../sidebundle-core" }
 sidebundle-closure = { path = "../sidebundle-closure" }
 sidebundle-packager = { path = "../sidebundle-packager" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"

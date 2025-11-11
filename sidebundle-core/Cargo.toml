@@ -6,3 +6,4 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+goblin = "0.10.3"
