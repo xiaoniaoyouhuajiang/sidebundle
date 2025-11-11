@@ -1,8 +1,12 @@
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
-use log::info;
+use log::{info, warn};
+use pathdiff::diff_paths;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sidebundle_core::{BundleSpec, DependencyClosure, EntryBundlePlan};
 use thiserror::Error;
 
@@ -51,25 +55,25 @@ impl Packager {
             source,
         })?;
 
+        let data_dir = bundle_root.join("data");
+        fs::create_dir_all(&data_dir).map_err(|source| PackagerError::Io {
+            path: data_dir.clone(),
+            source,
+        })?;
+
+        let mut manifest_files = Vec::new();
+
         for file in &closure.files {
+            let stored = store_in_data(&data_dir, &file.source, &file.digest)?;
+
             let dest_path = bundle_root.join(&file.destination);
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            fs::copy(&file.source, &dest_path).map_err(|source| PackagerError::Io {
-                path: dest_path.clone(),
-                source,
-            })?;
-            #[cfg(unix)]
-            {
-                if let Ok(meta) = fs::metadata(&file.source) {
-                    let perms = meta.permissions();
-                    fs::set_permissions(&dest_path, perms).ok();
-                }
-            }
+            link_or_copy(&stored, &dest_path)?;
+            manifest_files.push(ManifestFile {
+                origin: FileOrigin::Dependency,
+                source: file.source.display().to_string(),
+                destination: file.destination.clone(),
+                digest: file.digest.clone(),
+            });
         }
 
         for plan in &closure.entry_plans {
@@ -105,6 +109,45 @@ impl Packager {
                 })?;
             }
         }
+
+        let mut traced_manifest = Vec::new();
+        for path in &closure.traced_files {
+            match fs::metadata(path) {
+                Ok(meta) if meta.is_file() => {}
+                Ok(_) => {
+                    warn!(
+                        "traced path {} is not a regular file, skipping",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    warn!("failed to read traced path {}: {err}", path.display());
+                    continue;
+                }
+            }
+            let digest = compute_digest(path)?;
+            let stored = store_in_data(&data_dir, path, &digest)?;
+            let destination = traced_destination(path);
+            let dest_path = bundle_root.join(&destination);
+            link_or_copy(&stored, &dest_path)?;
+            traced_manifest.push(ManifestFile {
+                origin: FileOrigin::Trace,
+                source: path.display().to_string(),
+                destination,
+                digest,
+            });
+        }
+
+        write_manifest(
+            &bundle_root,
+            Manifest {
+                name: spec.name().to_string(),
+                target: spec.target().as_str().to_string(),
+                files: manifest_files,
+                traced_files: traced_manifest,
+            },
+        )?;
 
         info!(
             "bundle `{}` written to {}",
@@ -173,6 +216,147 @@ pub enum PackagerError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to serialize manifest: {0}")]
+    Manifest(serde_json::Error),
+}
+
+#[derive(Serialize)]
+struct Manifest {
+    name: String,
+    target: String,
+    files: Vec<ManifestFile>,
+    traced_files: Vec<ManifestFile>,
+}
+
+#[derive(Serialize)]
+struct ManifestFile {
+    origin: FileOrigin,
+    source: String,
+    destination: PathBuf,
+    digest: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FileOrigin {
+    Dependency,
+    Trace,
+}
+
+fn stored_data_path(data_dir: &Path, digest: &str) -> PathBuf {
+    data_dir.join(digest)
+}
+
+fn store_in_data(data_dir: &Path, source: &Path, digest: &str) -> Result<PathBuf, PackagerError> {
+    let stored = stored_data_path(data_dir, digest);
+    if stored.exists() {
+        return Ok(stored);
+    }
+    if let Some(parent) = stored.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::copy(source, &stored).map_err(|source| PackagerError::Io {
+        path: stored.clone(),
+        source,
+    })?;
+    copy_permissions(source, &stored).ok();
+    Ok(stored)
+}
+
+fn link_or_copy(stored: &Path, dest: &Path) -> Result<(), PackagerError> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    if dest.exists() {
+        fs::remove_file(dest).map_err(|source| PackagerError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        if let Some(parent) = dest.parent() {
+            if let Some(relative) = diff_paths(stored, parent) {
+                if symlink(&relative, dest).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    fs::copy(stored, dest).map_err(|source| PackagerError::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    copy_permissions(stored, dest).ok();
+    Ok(())
+}
+
+fn copy_permissions(src: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = fs::metadata(src) {
+            let perms = meta.permissions();
+            fs::set_permissions(dest, perms)?;
+        }
+    }
+    Ok(())
+}
+
+fn compute_digest(path: &Path) -> Result<String, PackagerError> {
+    let mut file = File::open(path).map_err(|source| PackagerError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| PackagerError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        FmtWrite::write_fmt(&mut hex, format_args!("{:02x}", byte)).expect("write digest");
+    }
+    Ok(hex)
+}
+
+fn traced_destination(path: &Path) -> PathBuf {
+    let mut dest = PathBuf::from("resources/traced");
+    let relative = if path.is_absolute() {
+        path.strip_prefix("/").unwrap_or(path)
+    } else {
+        path
+    };
+    dest.push(relative);
+    dest
+}
+
+fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), PackagerError> {
+    let manifest_path = bundle_root.join("manifest.lock");
+    let mut file = File::create(&manifest_path).map_err(|source| PackagerError::Io {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    serde_json::to_writer_pretty(&mut file, &manifest).map_err(PackagerError::Manifest)?;
+    file.write_all(b"\n").map_err(|source| PackagerError::Io {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
