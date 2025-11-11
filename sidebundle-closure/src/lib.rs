@@ -112,15 +112,15 @@ impl ClosureBuilder {
         let entry_metadata = self.load_metadata(&entry_source, cache)?;
         let entry_dest = ensure_file(files, &entry_source);
 
-        let interpreter_path =
-            entry_metadata
-                .interpreter
-                .clone()
-                .ok_or_else(|| ClosureError::MissingInterpreter {
-                    path: entry_source.clone(),
-                })?;
-        let interpreter_source = canonicalize(&interpreter_path)?;
-        let interpreter_dest = ensure_file(files, &interpreter_source);
+        let (interpreter_source, interpreter_dest, is_static) =
+            match entry_metadata.interpreter.clone() {
+                Some(path) => {
+                    let canonical = canonicalize(&path)?;
+                    let dest = ensure_file(files, &canonical);
+                    (Some(canonical), Some(dest), false)
+                }
+                None => (None, None, true),
+            };
 
         let mut lib_dirs: BTreeSet<PathBuf> = BTreeSet::new();
         if let Some(dir) = entry_dest.parent() {
@@ -137,9 +137,13 @@ impl ClosureBuilder {
             }
 
             let metadata = self.load_metadata(&current, cache)?;
+            if is_static {
+                continue;
+            }
+            let interpreter = interpreter_source.as_ref().expect("static skipped");
             let search_paths = self.compute_search_paths(&current, &metadata);
             let resolved =
-                self.trace_with_linker(&interpreter_source, &current, &search_paths, metadata)?;
+                self.trace_with_linker(interpreter, &current, &search_paths, metadata)?;
 
             for resolution in resolved {
                 if Self::should_skip(&resolution.name) {
@@ -155,13 +159,16 @@ impl ClosureBuilder {
             }
         }
 
+        let libraries: Vec<PathBuf> = lib_dirs.into_iter().collect();
+        let binary_destination = entry_dest.clone();
         Ok(EntryBundlePlan {
             display_name: entry.display_name.clone(),
             binary_source: entry_source.clone(),
-            binary_destination: entry_dest,
-            linker_source: interpreter_source,
-            linker_destination: interpreter_dest,
-            library_dirs: lib_dirs.into_iter().collect(),
+            binary_destination: binary_destination.clone(),
+            linker_source: interpreter_source.unwrap_or_else(|| entry_source.clone()),
+            linker_destination: interpreter_dest.unwrap_or_else(|| binary_destination.clone()),
+            library_dirs: libraries,
+            requires_linker: !is_static,
         })
     }
 

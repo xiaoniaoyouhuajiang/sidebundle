@@ -164,6 +164,7 @@ pub struct EntryBundlePlan {
     pub linker_source: PathBuf,
     pub linker_destination: PathBuf,
     pub library_dirs: Vec<PathBuf>,
+    pub requires_linker: bool,
 }
 
 /// 依赖闭包汇总结果，供装配/打包复用。

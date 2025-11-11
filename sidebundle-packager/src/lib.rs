@@ -117,6 +117,21 @@ impl Packager {
 
 fn render_launcher(plan: &EntryBundlePlan) -> String {
     let binary_ref = format!("${{BUNDLE_ROOT}}/{}", plan.binary_destination.display());
+    if !plan.requires_linker {
+        return format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_ROOT="$(cd "${{SCRIPT_DIR}}/.." && pwd)"
+
+BINARY="{binary}"
+exec "${{BINARY}}" "$@"
+"#,
+            binary = binary_ref
+        );
+    }
+
     let linker_ref = format!("${{BUNDLE_ROOT}}/{}", plan.linker_destination.display());
     let mut lib_dirs: Vec<String> = plan
         .library_dirs
@@ -185,6 +200,7 @@ mod tests {
             linker_source: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
             linker_destination: PathBuf::from("payload/lib64/ld-linux-x86-64.so.2"),
             library_dirs: vec![PathBuf::from("payload/lib64")],
+            requires_linker: true,
         };
         let content = render_launcher(&plan);
         assert!(content.contains("payload/bin/echo"));
