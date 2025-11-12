@@ -91,6 +91,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
 
     let default_backend = BackendPreference::from(image_backend);
     let grouped = group_image_entries(&from_image, default_backend)?;
+    let mut image_guards = Vec::new();
     for ((preference, reference), paths) in grouped {
         info!(
             "constructing closure for image `{}` via {:?} backend ({} entr{} )",
@@ -99,13 +100,15 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             paths.len(),
             if paths.len() == 1 { "y" } else { "ies" }
         );
-        let image_closure = build_image_closure(preference, &reference, &paths, target, trace_mode)
+        let image_result =
+            build_image_closure(preference, &reference, &paths, target, trace_mode)
             .with_context(|| {
                 format!("failed to build closure for image `{reference}` using backend {preference:?}")
             })?;
-        log_closure_stats(&format!("image `{reference}`"), &image_closure);
-        let report = closure.merge(image_closure);
+        log_closure_stats(&format!("image `{reference}`"), &image_result.closure);
+        let report = closure.merge(image_result.closure);
         log_merge_report(&reference, &report);
+        image_guards.push(image_result.guard);
     }
 
     if closure.entry_plans.is_empty() {
@@ -309,13 +312,18 @@ fn group_image_entries(
     Ok(map)
 }
 
+struct ImageClosureResult {
+    closure: DependencyClosure,
+    guard: ImageRoot,
+}
+
 fn build_image_closure(
     preference: BackendPreference,
     reference: &str,
     paths: &[PathBuf],
     target: TargetTriple,
     trace_mode: TraceMode,
-) -> Result<DependencyClosure> {
+) -> Result<ImageClosureResult> {
     if paths.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
@@ -326,7 +334,7 @@ fn build_image_closure(
     let mut errors = Vec::new();
     for backend in attempts {
         match build_with_backend(backend, reference, paths, target, trace_mode) {
-            Ok(closure) => return Ok(closure),
+            Ok(result) => return Ok(result),
             Err(err) => {
                 errors.push(format!("{backend:?}: {err:?}"));
             }
@@ -344,21 +352,25 @@ fn build_with_backend(
     paths: &[PathBuf],
     target: TargetTriple,
     trace_mode: TraceMode,
-) -> Result<DependencyClosure> {
+) -> Result<ImageClosureResult> {
     match backend {
         BackendPreference::Docker => {
             let provider = DockerProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
-            build_closure_from_root("docker", reference, target, root, paths, trace_mode)
+            let closure =
+                build_closure_from_root("docker", reference, target, root.rootfs(), paths, trace_mode)?;
+            Ok(ImageClosureResult { closure, guard: root })
         }
         BackendPreference::Podman | BackendPreference::Auto => {
             let provider = PodmanProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            build_closure_from_root("podman", reference, target, root, paths, trace_mode)
+            let closure =
+                build_closure_from_root("podman", reference, target, root.rootfs(), paths, trace_mode)?;
+            Ok(ImageClosureResult { closure, guard: root })
         }
     }
 }
@@ -367,13 +379,13 @@ fn build_closure_from_root(
     backend_name: &'static str,
     reference: &str,
     target: TargetTriple,
-    root: ImageRoot,
+    rootfs: &Path,
     entry_paths: &[PathBuf],
     trace_mode: TraceMode,
 ) -> Result<DependencyClosure> {
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
     for (idx, virtual_path) in entry_paths.iter().enumerate() {
-        let physical = physical_image_path(root.rootfs(), virtual_path);
+        let physical = physical_image_path(rootfs, virtual_path);
         std::fs::metadata(&physical).with_context(|| {
             format!(
                 "image `{reference}` missing executable {} (resolved path {})",
@@ -389,16 +401,16 @@ fn build_closure_from_root(
         spec.push_entry(BundleEntry::new(physical, display));
     }
 
-    let mut builder = ClosureBuilder::new().with_chroot_root(root.rootfs().to_path_buf());
+    let mut builder = ClosureBuilder::new().with_chroot_root(rootfs.to_path_buf());
     if trace_mode != TraceMode::Off {
-        let tracer = TraceCollector::new().with_root(root.rootfs().to_path_buf());
+        let tracer = TraceCollector::new().with_root(rootfs.to_path_buf());
         builder = builder.with_tracer(tracer);
     }
 
     let mut closure = builder
         .build(&spec)
         .with_context(|| format!("failed to build closure inside image `{reference}`"))?;
-    normalize_image_closure(&mut closure, root.rootfs());
+    normalize_image_closure(&mut closure, rootfs);
     Ok(closure)
 }
 

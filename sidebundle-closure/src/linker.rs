@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -211,15 +212,27 @@ impl LinkerRunner {
 }
 
 fn translate_within_root(root: &Path, path: &Path) -> Result<PathBuf, LinkerError> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| LinkerError::PathOutsideRoot {
+    if let Ok(rel) = path.strip_prefix(root) {
+        let mut translated = PathBuf::from("/");
+        translated.push(rel);
+        Ok(translated)
+    } else if path.is_absolute() {
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let rebased = root.join(rel);
+        if fs::metadata(&rebased).is_ok() {
+            Ok(rebased)
+        } else {
+            Err(LinkerError::PathOutsideRoot {
+                path: path.to_path_buf(),
+                root: root.to_path_buf(),
+            })
+        }
+    } else {
+        Err(LinkerError::PathOutsideRoot {
             path: path.to_path_buf(),
             root: root.to_path_buf(),
-        })?;
-    let mut translated = PathBuf::from("/");
-    translated.push(rel);
-    Ok(translated)
+        })
+    }
 }
 
 fn nix_err_to_io(err: nix::Error) -> io::Error {

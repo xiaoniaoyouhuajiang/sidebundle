@@ -129,14 +129,14 @@ impl ClosureBuilder {
         files: &mut BTreeMap<PathBuf, PathBuf>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
-        let entry_source = canonicalize(&entry.path)?;
+        let entry_source = canonicalize(&entry.path, self.chroot_root.as_deref())?;
         let entry_metadata = self.load_metadata(&entry_source, cache)?;
         let entry_dest = ensure_file(files, &entry_source);
 
         let (interpreter_source, interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
                 Some(path) => {
-                    let canonical = canonicalize(&path)?;
+                    let canonical = canonicalize(&path, self.chroot_root.as_deref())?;
                     let dest = ensure_file(files, &canonical);
                     (Some(canonical), Some(dest), false)
                 }
@@ -171,12 +171,12 @@ impl ClosureBuilder {
                     continue;
                 }
 
-                let canonical = canonicalize(&resolution.target)?;
-                let dest = ensure_file(files, &canonical);
-                if let Some(dir) = dest.parent() {
-                    lib_dirs.insert(dir.to_path_buf());
-                }
-                queue.push_back(canonical);
+                    let canonical = canonicalize(&resolution.target, self.chroot_root.as_deref())?;
+                    let dest = ensure_file(files, &canonical);
+                    if let Some(dir) = dest.parent() {
+                        lib_dirs.insert(dir.to_path_buf());
+                    }
+                    queue.push_back(canonical);
             }
         }
 
@@ -279,11 +279,33 @@ impl ClosureBuilder {
     }
 }
 
-fn canonicalize(path: &Path) -> Result<PathBuf, ClosureError> {
-    fs::canonicalize(path).map_err(|source| ClosureError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+fn canonicalize(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureError> {
+    let target = if let Some(root) = root {
+        if path.starts_with(root) {
+            path.to_path_buf()
+        } else if path.is_absolute() {
+            let rel = path.strip_prefix("/").unwrap_or(path);
+            root.join(rel)
+        } else {
+            root.join(path)
+        }
+    } else {
+        path.to_path_buf()
+    };
+    match fs::canonicalize(&target) {
+        Ok(resolved) => {
+            if let Some(root) = root {
+                if !resolved.starts_with(root) && path.is_absolute() {
+                    return Ok(target);
+                }
+            }
+            Ok(resolved)
+        }
+        Err(source) => Err(ClosureError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn ensure_file(mapping: &mut BTreeMap<PathBuf, PathBuf>, source: &Path) -> PathBuf {
