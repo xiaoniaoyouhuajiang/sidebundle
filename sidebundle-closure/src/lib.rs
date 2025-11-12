@@ -31,12 +31,12 @@ const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/ru
 const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
 
 /// Builds dependency closures for host executables.
-#[derive(Default)]
 pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
+    chroot_root: Option<PathBuf>,
 }
 
 impl ClosureBuilder {
@@ -52,6 +52,7 @@ impl ClosureBuilder {
                 .collect(),
             runner: LinkerRunner::new(),
             tracer: None,
+            chroot_root: None,
         }
     }
 
@@ -61,6 +62,16 @@ impl ClosureBuilder {
         if let Some(tracer) = self.tracer.take() {
             self.tracer = Some(tracer.with_root(root_buf.clone()));
         }
+        self.chroot_root = Some(root_buf.clone());
+        self.default_paths = DEFAULT_LIBRARY_DIRS
+            .iter()
+            .map(|dir| rebase_path(&root_buf, Path::new(dir)))
+            .collect();
+        self.ld_library_paths = self
+            .ld_library_paths
+            .into_iter()
+            .map(|path| rebase_path(&root_buf, &path))
+            .collect();
         self
     }
 
@@ -315,6 +326,17 @@ fn compute_digest(path: &Path) -> Result<String, ClosureError> {
         write!(&mut hex, "{:02x}", byte).expect("write to string");
     }
     Ok(hex)
+}
+
+fn rebase_path(root: &Path, path: &Path) -> PathBuf {
+    if path.starts_with(root) {
+        path.to_path_buf()
+    } else if path.is_absolute() {
+        let stripped = path.strip_prefix("/").unwrap_or(path);
+        root.join(stripped)
+    } else {
+        root.join(path)
+    }
 }
 
 fn trace_path_allowed(path: &Path) -> bool {
