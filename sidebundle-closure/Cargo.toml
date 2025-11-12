@@ -12,6 +12,11 @@ thiserror = "1.0"
 nix = { version = "0.29", default-features = false, features = ["process", "fs", "signal", "ptrace"] }
 sha2 = "0.10"
 bollard = "0.19.4"
+tokio = { version = "1.37", features = ["rt-multi-thread", "fs", "io-util"] }
+futures-util = "0.3"
+bytes = "1"
+tar = "0.4"
+tempfile = "3"
+serde_json = "1.0"
 
 [dev-dependencies]
-tempfile = "3"
