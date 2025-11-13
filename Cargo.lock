@@ -1220,6 +1220,8 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "serde",
+ "serde_json",
  "sidebundle-closure",
  "sidebundle-core",
  "sidebundle-packager",

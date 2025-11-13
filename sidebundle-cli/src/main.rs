@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
+use serde::Deserialize;
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{TraceBackendKind, TraceCollector},
@@ -32,6 +34,13 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Create(args) => execute_create(args),
+        Commands::Agent(agent) => execute_agent(agent),
+    }
+}
+
+fn execute_agent(cmd: AgentCommands) -> Result<()> {
+    match cmd {
+        AgentCommands::Trace(args) => execute_agent_trace(args),
     }
 }
 
@@ -161,6 +170,55 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     Ok(())
 }
 
+fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
+    fs::create_dir_all(&args.output)
+        .with_context(|| format!("failed to create output dir {}", args.output.display()))?;
+    let spec_data = fs::read(&args.spec)
+        .with_context(|| format!("failed to read spec file {}", args.spec.display()))?;
+    let agent_spec: AgentSpec =
+        serde_json::from_slice(&spec_data).with_context(|| "failed to parse agent spec json")?;
+
+    let target = TargetTriple::parse(&agent_spec.target)
+        .with_context(|| format!("unsupported target triple: {}", agent_spec.target))?;
+    let mut spec = BundleSpec::new(agent_spec.name, target);
+    for (idx, entry) in agent_spec.entries.iter().enumerate() {
+        let mut resolved = entry.path.clone();
+        if !resolved.is_absolute() {
+            resolved = args.rootfs.join(&resolved);
+        }
+        let display = entry
+            .display
+            .clone()
+            .or_else(|| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str().map(|s| s.to_string()))
+            })
+            .unwrap_or_else(|| format!("agent-entry-{idx}"));
+        spec.push_entry(BundleEntry::new(resolved, display));
+    }
+
+    let mut builder = ClosureBuilder::new().with_chroot_root(args.rootfs.clone());
+    if args.trace_mode != TraceMode::Off {
+        let env_pairs = parse_image_env(&agent_spec.env);
+        let mut tracer = TraceCollector::new().with_root(args.rootfs.clone());
+        if !env_pairs.is_empty() {
+            tracer = tracer.with_env(env_pairs);
+        }
+        builder = builder.with_tracer(tracer);
+    }
+
+    let closure = builder
+        .build(&spec)
+        .context("agent: failed to build dependency closure")?;
+    let packager = Packager::new().with_output_root(&args.output);
+    packager
+        .emit(&spec, &closure)
+        .context("agent: packaging stage failed")?;
+    Ok(())
+}
+
 fn init_logger(level: LogLevel) -> Result<()> {
     let env = Env::default().default_filter_or(level.as_str());
     env_logger::Builder::from_env(env)
@@ -183,6 +241,9 @@ struct Cli {
 enum Commands {
     /// Create bundle artifacts
     Create(CreateArgs),
+    /// Internal helper to run trace/build stages inside a container
+    #[command(subcommand, hide = true)]
+    Agent(AgentCommands),
 }
 
 #[derive(Args)]
@@ -227,6 +288,41 @@ struct CreateArgs {
     /// Fail the build when linker validation finds missing dependencies
     #[arg(long = "strict-validate")]
     strict_validate: bool,
+}
+
+#[derive(Args)]
+struct AgentTraceArgs {
+    /// Absolute bundle root inside the container
+    #[arg(long = "rootfs", value_name = "DIR")]
+    rootfs: PathBuf,
+
+    /// JSON file describing the build spec
+    #[arg(long = "spec", value_name = "FILE")]
+    spec: PathBuf,
+
+    /// Output directory to write closure artifacts
+    #[arg(long = "output", value_name = "DIR")]
+    output: PathBuf,
+
+    /// Trace mode
+    #[arg(long = "trace-mode", value_enum, default_value_t = TraceMode::Auto)]
+    trace_mode: TraceMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSpec {
+    name: String,
+    target: String,
+    entries: Vec<AgentSpecEntry>,
+    #[serde(default)]
+    env: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSpecEntry {
+    path: PathBuf,
+    #[serde(default)]
+    display: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -629,6 +725,7 @@ mod tests {
                 assert_eq!(args.target, "linux-x86_64");
                 assert!(args.from_image.is_empty());
             }
+            _ => panic!("unexpected command variant"),
         }
     }
 
@@ -645,6 +742,11 @@ mod tests {
                 assert!(args.from_host.is_empty());
                 assert_eq!(args.from_image.len(), 1);
             }
+            _ => panic!("unexpected command variant"),
         }
     }
+}
+#[derive(Subcommand)]
+enum AgentCommands {
+    Trace(AgentTraceArgs),
 }
