@@ -5,7 +5,7 @@ pub use elf::{parse_elf_metadata, ElfMetadata, ElfParseError};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// 架构枚举，目前仅支持 x86_64，但预留扩展。
@@ -80,15 +80,44 @@ impl FromStr for TargetTriple {
 
 /// 用户声明的入口信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalPath {
+    origin: Origin,
+    path: PathBuf,
+}
+
+impl LogicalPath {
+    pub fn new(origin: Origin, path: impl Into<PathBuf>) -> Self {
+        Self {
+            origin,
+            path: path.into(),
+        }
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Origin {
+    Host,
+    Image(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleEntry {
-    pub path: PathBuf,
+    pub logical: LogicalPath,
     pub display_name: String,
 }
 
 impl BundleEntry {
-    pub fn new(path: impl Into<PathBuf>, display_name: impl Into<String>) -> Self {
+    pub fn new(logical: LogicalPath, display_name: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
+            logical,
             display_name: display_name.into(),
         }
     }
@@ -118,6 +147,10 @@ impl BundleSpec {
 
     pub fn push_entry(&mut self, entry: BundleEntry) {
         self.entries.push(entry);
+    }
+
+    pub fn host_entry(path: impl Into<PathBuf>, display_name: impl Into<String>) -> BundleEntry {
+        BundleEntry::new(LogicalPath::new(Origin::Host, path), display_name)
     }
 
     pub fn entries(&self) -> &[BundleEntry] {

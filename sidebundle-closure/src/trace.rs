@@ -1,4 +1,6 @@
+use crate::PathResolver;
 use nix::errno::Errno;
+use sidebundle_core::LogicalPath;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -13,7 +15,6 @@ pub use linux::{CombinedBackend, FanotifyBackend, PtraceBackend};
 #[derive(Debug, Clone)]
 pub struct TraceCollector {
     backend: TraceBackendKind,
-    root: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
 }
 
@@ -21,14 +22,8 @@ impl TraceCollector {
     pub fn new() -> Self {
         Self {
             backend: TraceBackendKind::default(),
-            root: None,
             env: Vec::new(),
         }
-    }
-
-    pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.root = Some(root.into());
-        self
     }
 
     pub fn with_env(mut self, env: Vec<(OsString, OsString)>) -> Self {
@@ -41,16 +36,51 @@ impl TraceCollector {
         self
     }
 
-    pub fn run(&self, command: &[String]) -> Result<TraceReport, TraceError> {
-        if command.is_empty() {
-            return Err(TraceError::EmptyCommand);
-        }
+    pub fn run(
+        &self,
+        resolver: &dyn PathResolver,
+        command: &TraceCommand,
+    ) -> Result<Vec<TraceArtifact>, TraceError> {
+        let mut argv = Vec::with_capacity(1 + command.args().len());
+        let program = resolver.to_trace_path(command.program());
+        argv.push(program.display().to_string());
+        argv.extend(command.args().iter().cloned());
         let invocation = TraceInvocation {
-            command,
-            root: self.root.as_deref(),
+            command: &argv,
+            root: resolver.trace_root(),
             env: &self.env,
         };
-        self.backend.trace(&invocation)
+        let report = self.backend.trace(&invocation)?;
+        Ok(report.into_artifacts(resolver))
+    }
+}
+
+/// Logical trace command executed by the backend.
+#[derive(Debug, Clone)]
+pub struct TraceCommand {
+    program: LogicalPath,
+    args: Vec<String>,
+}
+
+impl TraceCommand {
+    pub fn new(program: LogicalPath) -> Self {
+        Self {
+            program,
+            args: Vec::new(),
+        }
+    }
+
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+
+    pub fn program(&self) -> &LogicalPath {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
     }
 }
 
@@ -153,6 +183,13 @@ impl TraceBackend for NullBackend {
 }
 
 /// Aggregated trace output.
+#[derive(Debug, Clone)]
+pub struct TraceArtifact {
+    pub runtime_path: PathBuf,
+    pub host_path: Option<PathBuf>,
+    pub logical_path: Option<LogicalPath>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TraceReport {
     pub files: BTreeSet<PathBuf>,
@@ -170,6 +207,23 @@ impl TraceReport {
         for path in other.files {
             self.files.insert(path);
         }
+    }
+
+    pub fn into_artifacts(self, resolver: &dyn PathResolver) -> Vec<TraceArtifact> {
+        self.files
+            .into_iter()
+            .map(|runtime_path| {
+                let host_path = resolver.runtime_to_host(&runtime_path);
+                let logical_path = host_path
+                    .as_ref()
+                    .and_then(|path| resolver.host_to_logical(path));
+                TraceArtifact {
+                    runtime_path,
+                    host_path,
+                    logical_path,
+                }
+            })
+            .collect()
     }
 }
 

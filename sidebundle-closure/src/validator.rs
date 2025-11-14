@@ -193,10 +193,6 @@ pub enum LinkerFailure {
     InvalidPath {
         path: PathBuf,
     },
-    PathOutsideRoot {
-        path: PathBuf,
-        root: PathBuf,
-    },
     Other {
         message: String,
     },
@@ -222,9 +218,6 @@ impl From<LinkerError> for LinkerFailure {
                 LinkerFailure::LibraryNotFound { name, raw }
             }
             LinkerError::InvalidPath(path) => LinkerFailure::InvalidPath { path },
-            LinkerError::PathOutsideRoot { path, root } => {
-                LinkerFailure::PathOutsideRoot { path, root }
-            }
         }
     }
 }

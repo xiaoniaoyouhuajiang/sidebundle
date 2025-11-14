@@ -15,7 +15,9 @@ use sidebundle_closure::{
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ClosureBuilder,
 };
-use sidebundle_core::{BundleEntry, BundleSpec, DependencyClosure, MergeReport, TargetTriple};
+use sidebundle_core::{
+    BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, TargetTriple,
+};
 use sidebundle_packager::Packager;
 
 fn main() {
@@ -81,18 +83,15 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             .and_then(|n| n.to_str())
             .map(|s| s.to_owned())
             .unwrap_or_else(|| format!("entry-{idx}"));
-        spec.push_entry(BundleEntry::new(path, display));
+        spec.push_entry(BundleSpec::host_entry(path, display));
     }
 
     let mut builder = ClosureBuilder::new();
     if let Some(root) = &trace_root {
-        builder = builder.with_chroot_root(root.clone());
+        builder = builder.with_chroot_root(root.clone(), Origin::Host);
     }
     if trace_mode != TraceMode::Off {
-        let mut tracer = TraceCollector::new().with_backend(TraceBackendKind::combined());
-        if let Some(root) = &trace_root {
-            tracer = tracer.with_root(root.clone());
-        }
+        let tracer = TraceCollector::new().with_backend(TraceBackendKind::combined());
         builder = builder.with_tracer(tracer);
     }
 
@@ -180,12 +179,20 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
 
     let target = TargetTriple::parse(&agent_spec.target)
         .with_context(|| format!("unsupported target triple: {}", agent_spec.target))?;
-    let mut spec = BundleSpec::new(agent_spec.name, target);
+    let mut spec = BundleSpec::new(agent_spec.name.clone(), target);
+    let agent_origin = Origin::Image(agent_spec.name.clone());
     for (idx, entry) in agent_spec.entries.iter().enumerate() {
-        let mut resolved = entry.path.clone();
-        if !resolved.is_absolute() {
-            resolved = args.rootfs.join(&resolved);
+        let mut host_path = entry.path.clone();
+        if !host_path.is_absolute() {
+            host_path = args.rootfs.join(&host_path);
         }
+        std::fs::metadata(&host_path).with_context(|| {
+            format!(
+                "agent entry {} not found at {}",
+                entry.path.display(),
+                host_path.display()
+            )
+        })?;
         let display = entry
             .display
             .clone()
@@ -196,13 +203,15 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
                     .and_then(|n| n.to_str().map(|s| s.to_string()))
             })
             .unwrap_or_else(|| format!("agent-entry-{idx}"));
-        spec.push_entry(BundleEntry::new(resolved, display));
+        let logical = LogicalPath::new(agent_origin.clone(), entry.path.clone());
+        spec.push_entry(BundleEntry::new(logical, display));
     }
 
-    let mut builder = ClosureBuilder::new().with_chroot_root(args.rootfs.clone());
+    let mut builder =
+        ClosureBuilder::new().with_chroot_root(args.rootfs.clone(), agent_origin);
     if args.trace_mode != TraceMode::Off {
         let env_pairs = parse_image_env(&agent_spec.env);
-        let mut tracer = TraceCollector::new().with_root(args.rootfs.clone());
+        let mut tracer = TraceCollector::new();
         if !env_pairs.is_empty() {
             tracer = tracer.with_env(env_pairs);
         }
@@ -517,6 +526,7 @@ fn build_closure_from_root(
     let rootfs = root.rootfs();
     let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
+    let origin = Origin::Image(reference.to_string());
     for (idx, virtual_path) in entry_paths.iter().enumerate() {
         let physical = physical_image_path(rootfs, virtual_path);
         std::fs::metadata(&physical).with_context(|| {
@@ -531,12 +541,13 @@ fn build_closure_from_root(
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("image-entry-{idx}"));
-        spec.push_entry(BundleEntry::new(physical, display));
+        let logical = LogicalPath::new(origin.clone(), virtual_path.clone());
+        spec.push_entry(BundleEntry::new(logical, display));
     }
 
-    let mut builder = ClosureBuilder::new().with_chroot_root(rootfs.to_path_buf());
+    let mut builder = ClosureBuilder::new().with_chroot_root(rootfs.to_path_buf(), origin);
     if trace_mode != TraceMode::Off {
-        let mut tracer = TraceCollector::new().with_root(rootfs.to_path_buf());
+        let mut tracer = TraceCollector::new();
         if !image_env.is_empty() {
             tracer = tracer.with_env(image_env.clone());
         }
@@ -696,9 +707,6 @@ fn describe_status(status: &EntryValidationStatus) -> String {
             }
             LinkerFailure::InvalidPath { path } => {
                 format!("invalid path {}", path.display())
-            }
-            LinkerFailure::PathOutsideRoot { path, root } => {
-                format!("path {} outside chroot {}", path.display(), root.display())
             }
             LinkerFailure::Other { message } => message.clone(),
         },

@@ -8,13 +8,14 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use linker::{LibraryResolution, LinkerError, LinkerRunner};
 use log::debug;
 use sha2::{Digest, Sha256};
 use sidebundle_core::{
     parse_elf_metadata, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata, ElfParseError,
-    EntryBundlePlan, ResolvedFile, TracedFile,
+    EntryBundlePlan, LogicalPath, Origin, ResolvedFile, TracedFile,
 };
 use thiserror::Error;
 
@@ -30,6 +31,93 @@ const DEFAULT_LIBRARY_DIRS: &[&str] = &[
 const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
 const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
 
+pub trait PathResolver: Send + Sync {
+    fn trace_root(&self) -> Option<&Path>;
+    fn to_host(&self, logical: &LogicalPath) -> PathBuf;
+    fn to_trace_path(&self, logical: &LogicalPath) -> PathBuf;
+    fn runtime_to_host(&self, traced: &Path) -> Option<PathBuf>;
+    fn host_to_logical(&self, host_path: &Path) -> Option<LogicalPath>;
+}
+
+#[derive(Default)]
+pub struct HostPathResolver;
+
+impl PathResolver for HostPathResolver {
+    fn trace_root(&self) -> Option<&Path> {
+        None
+    }
+
+    fn to_host(&self, logical: &LogicalPath) -> PathBuf {
+        logical.path().to_path_buf()
+    }
+
+    fn to_trace_path(&self, logical: &LogicalPath) -> PathBuf {
+        logical.path().to_path_buf()
+    }
+
+    fn runtime_to_host(&self, traced: &Path) -> Option<PathBuf> {
+        Some(traced.to_path_buf())
+    }
+
+    fn host_to_logical(&self, host_path: &Path) -> Option<LogicalPath> {
+        Some(LogicalPath::new(Origin::Host, host_path.to_path_buf()))
+    }
+}
+
+pub struct ChrootPathResolver {
+    root: PathBuf,
+    origin: Origin,
+}
+
+impl ChrootPathResolver {
+    pub fn new(root: PathBuf, origin: Origin) -> Self {
+        Self { root, origin }
+    }
+}
+
+impl PathResolver for ChrootPathResolver {
+    fn trace_root(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
+    fn to_host(&self, logical: &LogicalPath) -> PathBuf {
+        let path = logical.path();
+        if path.is_absolute() {
+            let stripped = path.strip_prefix("/").unwrap_or(path);
+            self.root.join(stripped)
+        } else {
+            self.root.join(path)
+        }
+    }
+
+    fn to_trace_path(&self, logical: &LogicalPath) -> PathBuf {
+        let path = logical.path();
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            let mut rebuilt = PathBuf::from("/");
+            rebuilt.push(path);
+            rebuilt
+        }
+    }
+
+    fn runtime_to_host(&self, traced: &Path) -> Option<PathBuf> {
+        if traced.is_absolute() {
+            let stripped = traced.strip_prefix("/").unwrap_or(traced);
+            Some(self.root.join(stripped))
+        } else {
+            Some(self.root.join(traced))
+        }
+    }
+
+    fn host_to_logical(&self, host_path: &Path) -> Option<LogicalPath> {
+        let rel = host_path.strip_prefix(&self.root).ok()?;
+        let mut rebuilt = PathBuf::from("/");
+        rebuilt.push(rel);
+        Some(LogicalPath::new(self.origin.clone(), rebuilt))
+    }
+}
+
 /// Builds dependency closures for host executables.
 pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
@@ -37,6 +125,7 @@ pub struct ClosureBuilder {
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     chroot_root: Option<PathBuf>,
+    path_resolver: Arc<dyn PathResolver>,
 }
 
 impl ClosureBuilder {
@@ -53,16 +142,14 @@ impl ClosureBuilder {
             runner: LinkerRunner::new(),
             tracer: None,
             chroot_root: None,
+            path_resolver: Arc::new(HostPathResolver::default()),
         }
     }
 
-    pub fn with_chroot_root(mut self, root: impl Into<PathBuf>) -> Self {
+    pub fn with_chroot_root(mut self, root: impl Into<PathBuf>, origin: Origin) -> Self {
         let root_buf = root.into();
-        self.runner = self.runner.clone().with_root(root_buf.clone());
-        if let Some(tracer) = self.tracer.take() {
-            self.tracer = Some(tracer.with_root(root_buf.clone()));
-        }
         self.chroot_root = Some(root_buf.clone());
+        self.path_resolver = Arc::new(ChrootPathResolver::new(root_buf.clone(), origin));
         self.default_paths = DEFAULT_LIBRARY_DIRS
             .iter()
             .map(|dir| rebase_path(&root_buf, Path::new(dir)))
@@ -72,6 +159,11 @@ impl ClosureBuilder {
             .into_iter()
             .map(|path| rebase_path(&root_buf, &path))
             .collect();
+        self
+    }
+
+    pub fn with_path_resolver(mut self, resolver: Arc<dyn PathResolver>) -> Self {
+        self.path_resolver = resolver;
         self
     }
 
@@ -94,18 +186,21 @@ impl ClosureBuilder {
             let plan = self.build_entry(entry, &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
-                let trace_path = self.trace_path_for_entry(&entry.path);
-                match tracer.run(&[trace_path]) {
-                    Ok(report) => {
-                        for original in report.files {
-                            if let Some(artifact) = self.make_trace_artifact(&original) {
+                let command = trace::TraceCommand::new(entry.logical.clone());
+                match tracer.run(self.path_resolver.as_ref(), &command) {
+                    Ok(artifacts) => {
+                        for record in artifacts {
+                            if let Some(artifact) = self.make_trace_artifact(&record) {
                                 traced_map
                                     .entry(artifact.resolved.clone())
                                     .or_insert(artifact);
                             }
                         }
                     }
-                    Err(err) => debug!("trace for `{}` failed: {err}", entry.path.display()),
+                    Err(err) => debug!(
+                        "trace for `{}` failed: {err}",
+                        entry.logical.path().display()
+                    ),
                 }
             }
         }
@@ -130,41 +225,28 @@ impl ClosureBuilder {
         })
     }
 
-    fn trace_path_for_entry(&self, path: &Path) -> String {
-        if let Some(root) = &self.chroot_root {
-            if let Ok(stripped) = path.strip_prefix(root) {
-                let mut rebuilt = PathBuf::from("/");
-                rebuilt.push(stripped);
-                return rebuilt.display().to_string();
-            }
-        }
-        path.display().to_string()
+    fn canonical_entry_path(&self, logical: &LogicalPath) -> Result<PathBuf, ClosureError> {
+        canonicalize(
+            &self.path_resolver.to_host(logical),
+            self.chroot_root.as_deref(),
+        )
     }
 
-    fn make_trace_artifact(&self, original: &Path) -> Option<TracedFile> {
-        let resolved = self.rebase_trace_path(original)?;
-        if !trace_path_allowed(&resolved) {
+    fn make_trace_artifact(
+        &self,
+        original: &trace::TraceArtifact,
+    ) -> Option<TracedFile> {
+        let resolved = original.host_path.as_ref()?;
+        if !trace_path_allowed(resolved) {
             return None;
         }
-        let is_elf = parse_elf_metadata(&resolved).is_ok();
+        let host_path = resolved.clone();
+        let is_elf = parse_elf_metadata(&host_path).is_ok();
         Some(TracedFile {
-            original: original.to_path_buf(),
-            resolved,
+            original: original.runtime_path.clone(),
+            resolved: host_path,
             is_elf,
         })
-    }
-
-    fn rebase_trace_path(&self, path: &Path) -> Option<PathBuf> {
-        if self.chroot_root.is_none() {
-            return Some(path.to_path_buf());
-        }
-        let root = self.chroot_root.as_ref().unwrap();
-        if path.is_absolute() {
-            let stripped = path.strip_prefix("/").unwrap_or(path);
-            Some(root.join(stripped))
-        } else {
-            Some(root.join(path))
-        }
     }
 
     fn promote_traced_elves(
@@ -197,7 +279,7 @@ impl ClosureBuilder {
         files: &mut BTreeMap<PathBuf, PathBuf>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
-        let entry_source = canonicalize(&entry.path, self.chroot_root.as_deref())?;
+        let entry_source = self.canonical_entry_path(&entry.logical)?;
         self.build_entry_plan(&entry_source, &entry.display_name, files, cache)
     }
 
@@ -479,14 +561,14 @@ pub enum ClosureError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{BundleEntry, TargetTriple};
+    use sidebundle_core::{BundleSpec, TargetTriple};
 
     #[test]
     fn closure_collects_host_binary() {
         #[cfg(target_os = "linux")]
         {
             let spec = BundleSpec::new("demo", TargetTriple::linux_x86_64())
-                .with_entry(BundleEntry::new("/bin/ls", "ls"));
+                .with_entry(BundleSpec::host_entry("/bin/ls", "ls"));
             let closure = ClosureBuilder::new().build(&spec).unwrap();
             assert!(
                 !closure.files.is_empty(),

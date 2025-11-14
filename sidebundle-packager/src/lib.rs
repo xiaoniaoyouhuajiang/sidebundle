@@ -405,14 +405,12 @@ fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), Packager
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{
-        BundleEntry, BundleSpec, DependencyClosure, EntryBundlePlan, TargetTriple,
-    };
+    use sidebundle_core::{BundleSpec, DependencyClosure, EntryBundlePlan, TargetTriple};
 
     #[test]
     fn empty_closure_rejected() {
         let spec = BundleSpec::new("demo", TargetTriple::linux_x86_64())
-            .with_entry(BundleEntry::new("/bin/echo", "echo"));
+            .with_entry(BundleSpec::host_entry("/bin/echo", "echo"));
         let closure = DependencyClosure::default();
         let packager = Packager::new();
         assert!(packager.emit(&spec, &closure).is_err());
