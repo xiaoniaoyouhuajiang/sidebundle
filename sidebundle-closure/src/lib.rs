@@ -218,7 +218,10 @@ impl ClosureBuilder {
             let plan = self.build_entry(entry, resolver.as_ref(), &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
-                let command = trace::TraceCommand::new(entry.logical.clone());
+                let mut command = trace::TraceCommand::new(entry.logical.clone());
+                if let Some(args) = &entry.trace_args {
+                    command = command.with_args(args.clone());
+                }
                 match tracer.run(resolver.as_ref(), &command) {
                     Ok(artifacts) => {
                         let origin = entry.logical.origin().clone();

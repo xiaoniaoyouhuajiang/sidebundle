@@ -112,6 +112,7 @@ pub enum Origin {
 pub struct BundleEntry {
     pub logical: LogicalPath,
     pub display_name: String,
+    pub trace_args: Option<Vec<String>>,
 }
 
 impl BundleEntry {
@@ -119,7 +120,13 @@ impl BundleEntry {
         Self {
             logical,
             display_name: display_name.into(),
+            trace_args: None,
         }
+    }
+
+    pub fn with_trace_args(mut self, args: Vec<String>) -> Self {
+        self.trace_args = Some(args);
+        self
     }
 }
 

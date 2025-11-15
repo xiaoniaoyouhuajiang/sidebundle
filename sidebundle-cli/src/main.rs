@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
 use serde::Deserialize;
+use shell_words;
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{TraceBackendKind, TraceCollector},
@@ -77,15 +78,20 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     );
 
     let mut spec = BundleSpec::new(name, target);
-    for (idx, path) in from_host.iter().enumerate() {
-        std::fs::metadata(path)
-            .with_context(|| format!("failed to read host executable: {}", path.display()))?;
-        let display = path
+    for (idx, entry) in from_host.iter().enumerate() {
+        std::fs::metadata(&entry.path)
+            .with_context(|| format!("failed to read host executable: {}", entry.path.display()))?;
+        let display = entry
+            .path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_owned())
             .unwrap_or_else(|| format!("entry-{idx}"));
-        spec.push_entry(BundleSpec::host_entry(path, display));
+        let mut bundle_entry = BundleSpec::host_entry(entry.path.clone(), display);
+        if let Some(args) = &entry.trace_args {
+            bundle_entry = bundle_entry.with_trace_args(args.clone());
+        }
+        spec.push_entry(bundle_entry);
     }
 
     let host_backend =
@@ -113,18 +119,18 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     let default_backend = BackendPreference::from(image_backend);
     let grouped = group_image_entries(&from_image, default_backend)?;
     let mut _resolver_guards = Vec::new();
-    for ((preference, reference), paths) in grouped {
+    for ((preference, reference), entries) in grouped {
         info!(
             "constructing closure for image `{}` via {:?} backend ({} entr{} )",
             reference,
             preference,
-            paths.len(),
-            if paths.len() == 1 { "y" } else { "ies" }
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
         );
         let image_result = build_image_closure(
             preference,
             &reference,
-            &paths,
+            &entries,
             target,
             image_backend_kind.clone(),
         )
@@ -218,7 +224,11 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
             })
             .unwrap_or_else(|| format!("agent-entry-{idx}"));
         let logical = LogicalPath::new(agent_origin.clone(), entry.path.clone());
-        spec.push_entry(BundleEntry::new(logical, display));
+        let mut bundle_entry = BundleEntry::new(logical, display);
+        if let Some(args) = &entry.trace {
+            bundle_entry = bundle_entry.with_trace_args(args.clone());
+        }
+        spec.push_entry(bundle_entry);
     }
 
     let mut resolver_set = ResolverSet::new();
@@ -278,11 +288,16 @@ enum Commands {
 
 #[derive(Args)]
 struct CreateArgs {
-    /// Executable paths on the host
-    #[arg(long = "from-host", value_name = "PATH", num_args = 0..)]
-    from_host: Vec<PathBuf>,
+    /// Executable specs on the host (PATH[::trace=<cmd>])
+    #[arg(
+        long = "from-host",
+        value_name = "SPEC",
+        value_parser = parse_host_entry,
+        num_args = 0..
+    )]
+    from_host: Vec<HostEntryArg>,
 
-    /// Image reference and path pairs (format: [backend://]IMAGE::/path/in/image)
+    /// Image reference and path pairs (format: [backend://]IMAGE::/path[::trace=<cmd>])
     #[arg(
         long = "from-image",
         value_name = "SPEC",
@@ -357,6 +372,8 @@ struct AgentSpecEntry {
     path: PathBuf,
     #[serde(default)]
     display: Option<String>,
+    #[serde(default)]
+    trace: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -426,14 +443,36 @@ impl From<ImageBackendArg> for BackendPreference {
 }
 
 #[derive(Debug, Clone)]
+struct HostEntryArg {
+    path: PathBuf,
+    trace_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
 struct ImageEntryArg {
     backend: Option<BackendPreference>,
     reference: String,
     path: PathBuf,
+    trace_args: Option<Vec<String>>,
+}
+
+fn parse_host_entry(value: &str) -> Result<HostEntryArg, String> {
+    let (path_part, trace_part) = split_trace_clause(value);
+    let trimmed = path_part.trim();
+    if trimmed.is_empty() {
+        return Err("host entry path cannot be empty".into());
+    }
+    let path = PathBuf::from(trimmed);
+    let trace_args = match trace_part {
+        Some(spec) => Some(parse_trace_args(spec)?),
+        None => None,
+    };
+    Ok(HostEntryArg { path, trace_args })
 }
 
 fn parse_image_entry(value: &str) -> Result<ImageEntryArg, String> {
-    let (image_part, path_part) = value
+    let (entry_part, trace_part) = split_trace_clause(value);
+    let (image_part, path_part) = entry_part
         .split_once("::")
         .ok_or_else(|| "expected format IMAGE::/path/in/image".to_string())?;
     if path_part.trim().is_empty() {
@@ -453,23 +492,46 @@ fn parse_image_entry(value: &str) -> Result<ImageEntryArg, String> {
     if reference.trim().is_empty() {
         return Err("image reference cannot be empty".into());
     }
+    let trace_args = match trace_part {
+        Some(spec) => Some(parse_trace_args(spec)?),
+        None => None,
+    };
     Ok(ImageEntryArg {
         backend,
         reference: reference.trim().to_string(),
         path,
+        trace_args,
     })
+}
+
+fn split_trace_clause(value: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = value.find("::trace=") {
+        let (entry, rest) = value.split_at(idx);
+        let spec = &rest["::trace=".len()..];
+        (entry, Some(spec))
+    } else {
+        (value, None)
+    }
+}
+
+fn parse_trace_args(spec: &str) -> Result<Vec<String>, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("trace command cannot be empty".into());
+    }
+    shell_words::split(trimmed).map_err(|err| format!("failed to parse trace command: {err}"))
 }
 
 fn group_image_entries(
     inputs: &[ImageEntryArg],
     default_backend: BackendPreference,
-) -> Result<BTreeMap<(BackendPreference, String), Vec<PathBuf>>> {
-    let mut map: BTreeMap<(BackendPreference, String), Vec<PathBuf>> = BTreeMap::new();
+) -> Result<BTreeMap<(BackendPreference, String), Vec<ImageEntryArg>>> {
+    let mut map: BTreeMap<(BackendPreference, String), Vec<ImageEntryArg>> = BTreeMap::new();
     for input in inputs {
         let preference = input.backend.unwrap_or(default_backend);
         map.entry((preference, input.reference.clone()))
             .or_default()
-            .push(input.path.clone());
+            .push(input.clone());
     }
     Ok(map)
 }
@@ -482,11 +544,11 @@ struct ImageClosureResult {
 fn build_image_closure(
     preference: BackendPreference,
     reference: &str,
-    paths: &[PathBuf],
+    entries: &[ImageEntryArg],
     target: TargetTriple,
     trace_backend: Option<TraceBackendKind>,
 ) -> Result<ImageClosureResult> {
-    if paths.is_empty() {
+    if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
     let attempts: Vec<BackendPreference> = match preference {
@@ -495,7 +557,7 @@ fn build_image_closure(
     };
     let mut errors = Vec::new();
     for backend in attempts {
-        match build_with_backend(backend, reference, paths, target, trace_backend.clone()) {
+        match build_with_backend(backend, reference, entries, target, trace_backend.clone()) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 errors.push(format!("{backend:?}: {err:?}"));
@@ -511,7 +573,7 @@ fn build_image_closure(
 fn build_with_backend(
     backend: BackendPreference,
     reference: &str,
-    paths: &[PathBuf],
+    entries: &[ImageEntryArg],
     target: TargetTriple,
     trace_backend: Option<TraceBackendKind>,
 ) -> Result<ImageClosureResult> {
@@ -526,7 +588,7 @@ fn build_with_backend(
                 reference,
                 target,
                 &root,
-                paths,
+                entries,
                 trace_backend.clone(),
             )
         }
@@ -535,7 +597,7 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            build_closure_from_root("podman", reference, target, &root, paths, trace_backend)
+            build_closure_from_root("podman", reference, target, &root, entries, trace_backend)
         }
     }
 }
@@ -545,29 +607,34 @@ fn build_closure_from_root(
     reference: &str,
     target: TargetTriple,
     root: &ImageRoot,
-    entry_paths: &[PathBuf],
+    entries: &[ImageEntryArg],
     trace_backend: Option<TraceBackendKind>,
 ) -> Result<ImageClosureResult> {
     let rootfs = root.rootfs().to_path_buf();
     let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
     let origin = Origin::Image(reference.to_string());
-    for (idx, virtual_path) in entry_paths.iter().enumerate() {
-        let physical = physical_image_path(&rootfs, virtual_path);
+    for (idx, entry_spec) in entries.iter().enumerate() {
+        let physical = physical_image_path(&rootfs, &entry_spec.path);
         std::fs::metadata(&physical).with_context(|| {
             format!(
                 "image `{reference}` missing executable {} (resolved path {})",
-                virtual_path.display(),
+                entry_spec.path.display(),
                 physical.display()
             )
         })?;
-        let display = virtual_path
+        let display = entry_spec
+            .path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("image-entry-{idx}"));
-        let logical = LogicalPath::new(origin.clone(), virtual_path.clone());
-        spec.push_entry(BundleEntry::new(logical, display));
+        let logical = LogicalPath::new(origin.clone(), entry_spec.path.clone());
+        let mut entry = BundleEntry::new(logical, display);
+        if let Some(args) = &entry_spec.trace_args {
+            entry = entry.with_trace_args(args.clone());
+        }
+        spec.push_entry(entry);
     }
 
     let mut resolvers = ResolverSet::new();
