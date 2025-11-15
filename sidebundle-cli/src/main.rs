@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -9,11 +9,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
-use serde::Deserialize;
 use shell_words;
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
-    trace::{TraceBackendKind, TraceCollector},
+    trace::{
+        TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand, TraceSpec,
+        TraceSpecReport, TRACE_REPORT_VERSION,
+    },
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ChrootPathResolver, ClosureBuilder, ResolverSet,
 };
@@ -194,68 +196,69 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
         .with_context(|| format!("failed to create output dir {}", args.output.display()))?;
     let spec_data = fs::read(&args.spec)
         .with_context(|| format!("failed to read spec file {}", args.spec.display()))?;
-    let agent_spec: AgentSpec =
-        serde_json::from_slice(&spec_data).with_context(|| "failed to parse agent spec json")?;
-
-    let target = TargetTriple::parse(&agent_spec.target)
-        .with_context(|| format!("unsupported target triple: {}", agent_spec.target))?;
-    let mut spec = BundleSpec::new(agent_spec.name.clone(), target);
-    let agent_origin = Origin::Image(agent_spec.name.clone());
-    for (idx, entry) in agent_spec.entries.iter().enumerate() {
-        let mut host_path = entry.path.clone();
-        if !host_path.is_absolute() {
-            host_path = args.rootfs.join(&host_path);
-        }
-        std::fs::metadata(&host_path).with_context(|| {
-            format!(
-                "agent entry {} not found at {}",
-                entry.path.display(),
-                host_path.display()
-            )
-        })?;
-        let display = entry
-            .display
-            .clone()
-            .or_else(|| {
-                entry
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str().map(|s| s.to_string()))
-            })
-            .unwrap_or_else(|| format!("agent-entry-{idx}"));
-        let logical = LogicalPath::new(agent_origin.clone(), entry.path.clone());
-        let mut bundle_entry = BundleEntry::new(logical, display);
-        if let Some(args) = &entry.trace {
-            bundle_entry = bundle_entry.with_trace_args(args.clone());
-        }
-        spec.push_entry(bundle_entry);
+    let trace_spec: TraceSpec =
+        serde_json::from_slice(&spec_data).with_context(|| "failed to parse trace spec json")?;
+    if trace_spec.commands.is_empty() {
+        bail!("agent: trace spec did not contain any commands");
     }
 
-    let mut resolver_set = ResolverSet::new();
-    let agent_resolver = Arc::new(ChrootPathResolver::from_root(
+    let backend =
+        resolve_trace_backend(args.trace_backend).context("failed to configure trace backend")?;
+    let mut tracer = if let Some(kind) = backend {
+        TraceCollector::new().with_backend(kind)
+    } else {
+        TraceCollector::new()
+    };
+    if !trace_spec.env.is_empty() {
+        let env_pairs = trace_spec
+            .env
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect();
+        tracer = tracer.with_env(env_pairs);
+    }
+
+    let resolver = Arc::new(ChrootPathResolver::from_root(
         args.rootfs.clone(),
-        agent_origin.clone(),
+        Origin::Host,
     ));
-    resolver_set.insert(agent_origin.clone(), agent_resolver);
-    let mut builder = ClosureBuilder::new().with_resolver_set(resolver_set.clone());
-    let agent_backend = resolve_trace_backend(args.trace_backend)
-        .context("failed to configure agent trace backend")?;
-    if let Some(kind) = agent_backend {
-        let env_pairs = parse_image_env(&agent_spec.env);
-        let mut tracer = TraceCollector::new().with_backend(kind);
-        if !env_pairs.is_empty() {
-            tracer = tracer.with_env(env_pairs);
+    let mut files = BTreeSet::new();
+    for command in &trace_spec.commands {
+        let Some(program) = command.argv.first() else {
+            continue;
+        };
+        let logical = LogicalPath::new(Origin::Host, PathBuf::from(program));
+        let mut trace_command = RuntimeTraceCommand::new(logical);
+        if command.argv.len() > 1 {
+            trace_command = trace_command.with_args(command.argv[1..].to_vec());
         }
-        builder = builder.with_tracer(tracer);
+        let artifacts = tracer
+            .run(resolver.as_ref(), &trace_command)
+            .with_context(|| format!("agent: trace invocation failed for {program}"))?;
+        for artifact in artifacts {
+            files.insert(artifact.runtime_path);
+        }
     }
 
-    let closure = builder
-        .build(&spec)
-        .context("agent: failed to build dependency closure")?;
-    let packager = Packager::new().with_output_root(&args.output);
-    packager
-        .emit(&spec, &closure)
-        .context("agent: packaging stage failed")?;
+    let report = TraceSpecReport {
+        schema_version: TRACE_REPORT_VERSION,
+        files: files.into_iter().collect(),
+    };
+    let report_path = args.output.join("trace-report.json");
+    let tmp_path = report_path.with_extension("tmp");
+    let data = serde_json::to_vec_pretty(&report).context("agent: failed to serialize report")?;
+    fs::write(&tmp_path, data).with_context(|| {
+        format!(
+            "agent: failed to write report temp file {}",
+            tmp_path.display()
+        )
+    })?;
+    fs::rename(&tmp_path, &report_path).with_context(|| {
+        format!(
+            "agent: failed to finalize report file {}",
+            report_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -356,24 +359,6 @@ struct AgentTraceArgs {
     /// Trace backend to use inside the agent
     #[arg(long = "trace-backend", value_enum, default_value_t = TraceBackendArg::Auto)]
     trace_backend: TraceBackendArg,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentSpec {
-    name: String,
-    target: String,
-    entries: Vec<AgentSpecEntry>,
-    #[serde(default)]
-    env: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentSpecEntry {
-    path: PathBuf,
-    #[serde(default)]
-    display: Option<String>,
-    #[serde(default)]
-    trace: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

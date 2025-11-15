@@ -5,6 +5,13 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+mod agent;
+
+pub use agent::{
+    AgentEngine, AgentEngineError, AgentTraceBackend, TraceCommand as AgentTraceCommand,
+    TraceLimits, TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION, TRACE_SPEC_VERSION,
+};
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -106,6 +113,7 @@ pub enum TraceBackendKind {
     Fanotify(FanotifyBackend),
     #[cfg(target_os = "linux")]
     Combined(CombinedBackend),
+    Agent(AgentTraceBackend),
 }
 
 impl TraceBackendKind {
@@ -137,6 +145,7 @@ impl TraceBackendKind {
             TraceBackendKind::Fanotify(backend) => backend.trace(invocation),
             #[cfg(target_os = "linux")]
             TraceBackendKind::Combined(backend) => backend.trace(invocation),
+            TraceBackendKind::Agent(backend) => backend.trace(invocation),
         }
     }
 }
@@ -258,6 +267,8 @@ pub enum TraceError {
     Fanotify(String),
     #[error("{0}")]
     Unsupported(&'static str),
+    #[error("agent backend error: {0}")]
+    Agent(String),
 }
 
 #[cfg(not(target_os = "linux"))]
