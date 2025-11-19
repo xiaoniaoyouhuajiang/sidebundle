@@ -1,16 +1,22 @@
+use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use sidebundle_core::EntryBundlePlan;
+use serde::Serialize;
+use sidebundle_core::{EntryBundlePlan, Origin, RuntimeMetadata};
 
 use crate::PackagerError;
 
 const LAUNCHER_BYTES: &[u8] = include_bytes!(env!("SIDEBUNDLE_LAUNCHER_BIN"));
 const CONFIG_DIR: &str = "launchers";
 const BINARY_NAME: &str = ".sidebundle-launcher";
+const CONFIG_EXT: &str = "json";
 
-pub fn write_launchers(bundle_root: &Path, plans: &[EntryBundlePlan]) -> Result<(), PackagerError> {
+pub fn write_launchers(
+    bundle_root: &Path,
+    plans: &[EntryBundlePlan],
+    metadata: &HashMap<Origin, RuntimeMetadata>,
+) -> Result<(), PackagerError> {
     let bin_dir = bundle_root.join("bin");
     fs::create_dir_all(&bin_dir).map_err(|source| PackagerError::Io {
         path: bin_dir.clone(),
@@ -30,39 +36,44 @@ pub fn write_launchers(bundle_root: &Path, plans: &[EntryBundlePlan]) -> Result<
     })?;
 
     for plan in plans {
-        write_config(&config_dir, plan)?;
+        let runtime = metadata.get(&plan.origin).cloned();
+        write_config(&config_dir, plan, runtime)?;
         link_entry(&bin_dir, plan)?;
     }
     Ok(())
 }
 
-fn write_config(dir: &Path, plan: &EntryBundlePlan) -> Result<(), PackagerError> {
-    let config_path = dir.join(format!("{}.conf", plan.display_name));
-    let mut file = fs::File::create(&config_path).map_err(|source| PackagerError::Io {
+#[derive(Serialize)]
+struct LauncherConfig {
+    dynamic: bool,
+    binary: PathBuf,
+    linker: Option<PathBuf>,
+    library_paths: Vec<PathBuf>,
+    metadata: Option<RuntimeMetadata>,
+}
+
+fn write_config(
+    dir: &Path,
+    plan: &EntryBundlePlan,
+    metadata: Option<RuntimeMetadata>,
+) -> Result<(), PackagerError> {
+    let config_path = dir.join(format!("{}.{}", plan.display_name, CONFIG_EXT));
+    let config = LauncherConfig {
+        dynamic: plan.requires_linker,
+        binary: plan.binary_destination.clone(),
+        linker: if plan.requires_linker {
+            Some(plan.linker_destination.clone())
+        } else {
+            None
+        },
+        library_paths: plan.library_dirs.clone(),
+        metadata,
+    };
+    let data = serde_json::to_vec_pretty(&config).map_err(PackagerError::Manifest)?;
+    fs::write(&config_path, data).map_err(|source| PackagerError::Io {
         path: config_path.clone(),
         source,
     })?;
-    let mut content = String::new();
-    content.push_str(&format!(
-        "dynamic={}\n",
-        if plan.requires_linker { 1 } else { 0 }
-    ));
-    content.push_str(&format!("binary={}\n", plan.binary_destination.display()));
-    if plan.requires_linker {
-        content.push_str(&format!("linker={}\n", plan.linker_destination.display()));
-        let joined = plan
-            .library_dirs
-            .iter()
-            .map(|dir| dir.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        content.push_str(&format!("library_paths={}\n", joined));
-    }
-    file.write_all(content.as_bytes())
-        .map_err(|source| PackagerError::Io {
-            path: config_path.clone(),
-            source,
-        })?;
     Ok(())
 }
 

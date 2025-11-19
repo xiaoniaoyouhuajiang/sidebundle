@@ -1,0 +1,18 @@
+[package]
+name = "userland-execve"
+version = "0.2.0"
+edition = "2021"
+description = "An implementation of execve() in user space"
+repository = "https://github.com/io12/userland-execve-rust"
+readme = "README.md"
+license = "MIT"
+
+[dependencies.goblin]
+version = "0.8.0"
+default-features = false
+features = ["elf32", "elf64", "endian_fd"]
+
+[dependencies.nix]
+version = "0.27.1"
+default-features = false
+features = ["mman", "feature", "user"]

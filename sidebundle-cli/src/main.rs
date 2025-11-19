@@ -1388,10 +1388,14 @@ fn capture_runtime_metadata() -> Result<RuntimeMetadata> {
             None
         }
     };
+    let platform = capture_platform_string();
+    let random = capture_random_bytes();
     Ok(RuntimeMetadata {
         auxv,
         env: env_map,
         uname,
+        platform,
+        random,
     })
 }
 
@@ -1443,6 +1447,30 @@ fn capture_uname() -> Result<SystemInfo> {
 
 fn uts_field_to_string(buf: &[libc::c_char]) -> String {
     unsafe { CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned() }
+}
+
+fn capture_platform_string() -> Option<String> {
+    unsafe {
+        let ptr = libc::getauxval(libc::AT_PLATFORM) as *const libc::c_char;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
+    }
+}
+
+fn capture_random_bytes() -> Option<[u8; 16]> {
+    unsafe {
+        let ptr = libc::getauxval(libc::AT_RANDOM) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr, 16);
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(slice);
+        Some(buf)
+    }
 }
 
 fn describe_status(status: &EntryValidationStatus) -> String {

@@ -237,6 +237,7 @@ mod tests {
             linker_destination: PathBuf::from("payload/lib64/ld-linux-x86-64.so.2"),
             library_dirs: vec![PathBuf::from("payload/lib64")],
             requires_linker: require_linker,
+            origin: Origin::Host,
         }
     }
 

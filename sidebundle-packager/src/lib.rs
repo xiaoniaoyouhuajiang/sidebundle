@@ -172,7 +172,7 @@ impl Packager {
             write_bundle_symlink(&bundle_root, link)?;
         }
 
-        write_launchers(&bundle_root, &closure.entry_plans)?;
+        write_launchers(&bundle_root, &closure.entry_plans, &closure.metadata)?;
         let mut traced_manifest = Vec::new();
         for traced in &traced_queue {
             let mut source_path = traced.resolved.clone();

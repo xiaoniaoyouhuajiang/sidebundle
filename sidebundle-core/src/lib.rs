@@ -135,11 +135,19 @@ pub struct RuntimeMetadata {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uname: Option<SystemInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random: Option<[u8; 16]>,
 }
 
 impl RuntimeMetadata {
     pub fn is_empty(&self) -> bool {
-        self.auxv.is_empty() && self.env.is_empty() && self.uname.is_none()
+        self.auxv.is_empty()
+            && self.env.is_empty()
+            && self.uname.is_none()
+            && self.platform.is_none()
+            && self.random.is_none()
     }
 }
 
@@ -240,6 +248,7 @@ pub struct EntryBundlePlan {
     pub linker_destination: PathBuf,
     pub library_dirs: Vec<PathBuf>,
     pub requires_linker: bool,
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone)]

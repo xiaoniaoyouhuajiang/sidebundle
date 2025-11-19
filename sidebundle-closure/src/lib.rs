@@ -557,6 +557,7 @@ impl ClosureBuilder {
             linker_destination: interpreter_dest.unwrap_or_else(|| binary_destination.clone()),
             library_dirs: libraries,
             requires_linker: !is_static,
+            origin: origin.clone(),
         })
     }
 
