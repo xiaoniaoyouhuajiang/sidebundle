@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
+use std::fmt;
 use sidebundle_closure::{
     image::ImageConfig,
     trace::{AgentTraceCommand, TraceSpec, TraceSpecReport},
@@ -308,10 +310,10 @@ struct DockerContainerConfig {
     env: Option<Vec<String>>,
     #[serde(rename = "WorkingDir")]
     working_dir: Option<String>,
-    #[serde(rename = "Entrypoint")]
-    entrypoint: Option<Vec<String>>,
-    #[serde(rename = "Cmd")]
-    cmd: Option<Vec<String>>,
+    #[serde(rename = "Entrypoint", default, deserialize_with = "string_or_seq")]
+    entrypoint: Vec<String>,
+    #[serde(rename = "Cmd", default, deserialize_with = "string_or_seq")]
+    cmd: Vec<String>,
 }
 
 impl DockerContainerConfig {
@@ -321,11 +323,74 @@ impl DockerContainerConfig {
                 .working_dir
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from),
-            entrypoint: self.entrypoint.unwrap_or_default(),
-            cmd: self.cmd.unwrap_or_default(),
+            entrypoint: self.entrypoint,
+            cmd: self.cmd,
             env: self.env.unwrap_or_default(),
         }
     }
+}
+
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrSeqVisitor;
+
+    impl<'de> de::Visitor<'de> for StringOrSeqVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or list of strings")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrSeqVisitor)
 }
 
 pub(crate) struct RootfsExport {
