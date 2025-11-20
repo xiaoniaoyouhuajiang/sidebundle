@@ -688,13 +688,30 @@ fn canonicalize(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureErro
     } else {
         path.to_path_buf()
     };
+    debug!(
+        "canonicalize request path {} root {:?} => candidate {}",
+        path.display(),
+        root.map(|r| r.display().to_string()),
+        target.display()
+    );
     match fs::canonicalize(&target) {
         Ok(resolved) => {
             if let Some(root) = root {
                 if !resolved.starts_with(root) && path.is_absolute() {
+                    debug!(
+                        "canonicalize {} resolved outside root {}; returning candidate {}",
+                        path.display(),
+                        root.display(),
+                        target.display()
+                    );
                     return Ok(target);
                 }
             }
+            debug!(
+                "canonicalize {} resolved to {}",
+                path.display(),
+                resolved.display()
+            );
             Ok(resolved)
         }
         Err(source) => Err(ClosureError::Io {

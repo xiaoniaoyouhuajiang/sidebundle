@@ -126,10 +126,7 @@ fn build_env_block(bundle_root: &Path, config: &LauncherConfig) -> Result<Vec<CS
 
 fn build_aux_snapshot(metadata: &RuntimeMetadata) -> Option<AuxSnapshot> {
     let sanitized = sanitize_metadata(metadata);
-    if sanitized.auxv.is_empty()
-        && sanitized.platform.is_none()
-        && sanitized.random.is_none()
-    {
+    if sanitized.auxv.is_empty() && sanitized.platform.is_none() && sanitized.random.is_none() {
         return None;
     }
     let entries = sanitized
@@ -151,8 +148,8 @@ fn exec_static(entry: &Path, argv: &[CString], envp: &[CString]) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::ptr;
 
-    let entry_cstr = CString::new(entry.as_os_str().as_bytes())
-        .map_err(|err| anyhow!("invalid path: {err}"))?;
+    let entry_cstr =
+        CString::new(entry.as_os_str().as_bytes()).map_err(|err| anyhow!("invalid path: {err}"))?;
     let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
     argv_ptrs.push(ptr::null());
     let mut env_ptrs: Vec<*const libc::c_char> = envp.iter().map(|env| env.as_ptr()).collect();

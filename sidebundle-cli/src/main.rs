@@ -6,21 +6,20 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
-use serde::Deserialize;
+use pathdiff::diff_paths;
 use sha2::{Digest, Sha256};
 use shell_words;
 use sidebundle_closure::{
-    image::{DockerProvider, ImageConfig, ImageRoot, ImageRootProvider, PodmanProvider},
+    image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{
-        AgentTraceCommand, TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand,
-        TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION,
+        TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand, TraceSpec,
+        TraceSpecReport, TRACE_REPORT_VERSION,
     },
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ChrootPathResolver, ClosureBuilder, PathResolver, ResolverSet,
@@ -30,7 +29,9 @@ use sidebundle_core::{
     ResolvedFile, RuntimeMetadata, SystemInfo, TargetTriple,
 };
 use sidebundle_packager::Packager;
-use tempfile::TempDir;
+
+mod agent;
+use agent::{AgentLaunchConfig, AgentRunResult, AgentTraceRunner};
 
 fn main() {
     let cli = Cli::parse();
@@ -72,6 +73,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         image_agent_bin,
         image_agent_cli,
         image_agent_keep_output,
+        image_agent_keep_rootfs,
         strict_validate,
     } = args;
 
@@ -112,8 +114,13 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     let image_backend_choice = image_trace_backend.unwrap_or(trace_backend);
     let agent_launch = if matches!(image_backend_choice, TraceBackendArg::Agent) {
         Some(
-            AgentLaunchConfig::from_args(image_agent_bin, image_agent_cli, image_agent_keep_output)
-                .context("failed to configure image agent settings")?,
+            AgentLaunchConfig::from_args(
+                image_agent_bin,
+                image_agent_cli,
+                image_agent_keep_output,
+                image_agent_keep_rootfs,
+            )
+            .context("failed to configure image agent settings")?,
         )
     } else {
         None
@@ -376,6 +383,10 @@ struct CreateArgs {
     #[arg(long = "image-agent-keep-output")]
     image_agent_keep_output: bool,
 
+    /// Preserve the exported agent rootfs directory for debugging
+    #[arg(long = "image-agent-keep-rootfs")]
+    image_agent_keep_rootfs: bool,
+
     /// Fail the build when linker validation finds missing dependencies
     #[arg(long = "strict-validate")]
     strict_validate: bool,
@@ -451,7 +462,7 @@ impl From<LogLevel> for LevelFilter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-enum BackendPreference {
+pub(crate) enum BackendPreference {
     Auto,
     Docker,
     Podman,
@@ -474,7 +485,7 @@ struct HostEntryArg {
 }
 
 #[derive(Debug, Clone)]
-struct ImageEntryArg {
+pub(crate) struct ImageEntryArg {
     backend: Option<BackendPreference>,
     reference: String,
     path: PathBuf,
@@ -784,6 +795,7 @@ fn build_agent_image_closure(
         launch.command_for_backend(backend),
         launch.bin_path.clone(),
         launch.keep_output,
+        launch.keep_rootfs,
     )?;
     debug!(
         "agent: launching container backed by {:?} for `{}`",
@@ -822,11 +834,12 @@ fn build_agent_image_closure(
             );
         }
     }
-    let export_guard = rootfs;
-    let export_path = export_guard.path().to_path_buf();
+    let (export_path, cleanup_guard) = rootfs.into_parts();
     let config = config;
     let mut image_root = ImageRoot::new(reference, export_path, config);
-    image_root = image_root.with_cleanup(move || drop(export_guard));
+    if let Some(guard) = cleanup_guard {
+        image_root = image_root.with_cleanup(move || drop(guard));
+    }
     build_closure_from_root(
         backend,
         backend_name,
@@ -854,6 +867,7 @@ fn build_closure_from_root(
     metadata: Option<RuntimeMetadata>,
 ) -> Result<ImageClosureResult> {
     let rootfs = root.rootfs().to_path_buf();
+    ensure_image_library_aliases(&rootfs);
     let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
     let origin = Origin::Image(reference.to_string());
@@ -912,35 +926,117 @@ fn build_closure_from_root(
     })
 }
 
+fn ensure_image_library_aliases(rootfs: &Path) {
+    #[cfg(not(unix))]
+    {
+        let _ = rootfs;
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        const CANDIDATES: &[(&str, &str)] = &[
+            ("/lib64", "/lib/x86_64-linux-gnu"),
+            ("/usr/lib64", "/usr/lib/x86_64-linux-gnu"),
+        ];
+
+        for (alias, target) in CANDIDATES {
+            let alias_rel = alias.trim_start_matches('/');
+            let target_rel = target.trim_start_matches('/');
+            if alias_rel.is_empty() || target_rel.is_empty() {
+                continue;
+            }
+            debug!(
+                "image root {} evaluating alias {} -> {}",
+                rootfs.display(),
+                alias,
+                target
+            );
+            let alias_path = rootfs.join(alias_rel);
+            let target_path = rootfs.join(target_rel);
+            if !target_path.exists() {
+                debug!(
+                    "image root {} missing target {} for alias {}",
+                    rootfs.display(),
+                    target_rel,
+                    alias
+                );
+                continue;
+            }
+            if let Some(parent) = alias_path.parent() {
+                if let Err(err) = fs::create_dir_all(parent) {
+                    warn!(
+                        "failed to prepare parent {} for alias {}: {err}",
+                        parent.display(),
+                        alias
+                    );
+                    continue;
+                }
+            }
+            let relative_target = alias_path
+                .parent()
+                .and_then(|parent| diff_paths(&target_path, parent))
+                .unwrap_or(target_path.clone());
+            if alias_path.exists() {
+                match fs::remove_file(&alias_path) {
+                    Ok(()) => {
+                        debug!(
+                            "image root {} removed existing alias target {}",
+                            rootfs.display(),
+                            alias_path.display()
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => {
+                        debug!(
+                            "image root {} removing directory alias target {}",
+                            rootfs.display(),
+                            alias_path.display()
+                        );
+                        if let Err(dir_err) = fs::remove_dir_all(&alias_path) {
+                            warn!(
+                                "image root {} failed to remove existing {}: {dir_err}",
+                                rootfs.display(),
+                                alias_path.display()
+                            );
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "image root {} failed to remove existing {}: {err}",
+                            rootfs.display(),
+                            alias_path.display()
+                        );
+                        continue;
+                    }
+                }
+            }
+            match symlink(&relative_target, &alias_path) {
+                Ok(()) => debug!(
+                    "image root {} created alias {} -> {}",
+                    rootfs.display(),
+                    alias,
+                    target
+                ),
+                Err(err) => warn!(
+                    "failed to create alias {} -> {} inside {}: {err}",
+                    alias,
+                    target,
+                    rootfs.display()
+                ),
+            }
+        }
+    }
+}
+
 fn physical_image_path(rootfs: &Path, virtual_path: &Path) -> PathBuf {
     let relative = virtual_path
         .strip_prefix("/")
         .unwrap_or(virtual_path)
         .to_path_buf();
     rootfs.join(relative)
-}
-
-fn build_agent_trace_spec(entries: &[ImageEntryArg], config: &ImageConfig) -> TraceSpec {
-    let mut spec = TraceSpec::new();
-    if !config.env.is_empty() {
-        spec.env = config
-            .env
-            .iter()
-            .filter_map(|pair| pair.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-    }
-    for entry in entries {
-        let mut argv = vec![entry.path.display().to_string()];
-        if let Some(args) = &entry.trace_args {
-            argv.extend(args.clone());
-        }
-        spec.commands.push(AgentTraceCommand {
-            argv,
-            cwd: config.workdir.as_ref().map(|p| p.clone()),
-        });
-    }
-    spec
 }
 
 fn configure_image_trace_backend(
@@ -1007,295 +1103,6 @@ fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind
             bail!("agent trace backend is only available for image inputs");
         }
     }
-}
-
-fn parse_engine_command(value: &str) -> Result<Vec<OsString>> {
-    let parts = shell_words::split(value)
-        .map_err(|err| anyhow::anyhow!("invalid agent CLI command `{value}`: {err}"))?;
-    if parts.is_empty() {
-        bail!("agent CLI command cannot be empty");
-    }
-    Ok(parts.into_iter().map(OsString::from).collect())
-}
-
-#[derive(Clone)]
-struct AgentLaunchConfig {
-    bin_path: PathBuf,
-    keep_output: bool,
-    cli_override: Option<Vec<OsString>>,
-}
-
-impl AgentLaunchConfig {
-    fn from_args(
-        bin_override: Option<PathBuf>,
-        cli_override: Option<String>,
-        keep_output: bool,
-    ) -> Result<Self> {
-        let mut raw_path = if let Some(path) = bin_override {
-            path
-        } else {
-            env::current_exe().context("failed to locate sidebundle executable")?
-        };
-        if !raw_path.is_absolute() {
-            raw_path = env::current_dir()
-                .context("failed to resolve current directory for agent binary lookup")?
-                .join(raw_path);
-        }
-        let bin_path = fs::canonicalize(&raw_path).with_context(|| {
-            format!(
-                "failed to canonicalize image agent binary at {}",
-                raw_path.display()
-            )
-        })?;
-        let cli_override = match cli_override {
-            Some(spec) => Some(parse_engine_command(&spec)?),
-            None => None,
-        };
-        Ok(Self {
-            bin_path,
-            keep_output,
-            cli_override,
-        })
-    }
-
-    fn command_for_backend(&self, backend: BackendPreference) -> Vec<OsString> {
-        if let Some(cmd) = &self.cli_override {
-            return cmd.clone();
-        }
-        match backend {
-            BackendPreference::Podman | BackendPreference::Auto => vec![OsString::from("podman")],
-            _ => vec![OsString::from("docker")],
-        }
-    }
-}
-
-struct AgentRunResult {
-    report: TraceSpecReport,
-    rootfs: TempDir,
-    config: ImageConfig,
-}
-
-struct AgentTraceRunner {
-    runtime_cmd: Vec<OsString>,
-    agent_bin: PathBuf,
-    keep_output: bool,
-}
-
-impl AgentTraceRunner {
-    fn new(cmd: Vec<OsString>, agent_bin: PathBuf, keep_output: bool) -> Result<Self> {
-        if cmd.is_empty() {
-            bail!("agent runtime command cannot be empty");
-        }
-        Ok(Self {
-            runtime_cmd: cmd,
-            agent_bin,
-            keep_output,
-        })
-    }
-
-    fn run(&self, reference: &str, entries: &[ImageEntryArg]) -> Result<AgentRunResult> {
-        let spec_dir = TempDir::new().context("failed to create agent spec dir")?;
-        let out_dir = TempDir::new().context("failed to create agent output dir")?;
-        let export_dir = TempDir::new().context("failed to create agent rootfs dir")?;
-
-        let container_name = format!(
-            "sidebundle-agent-{}-{}",
-            sanitize_reference(reference),
-            current_millis()
-        );
-        let mut create_cmd = self.base_command();
-        create_cmd
-            .arg("create")
-            .arg("--name")
-            .arg(&container_name)
-            .arg("--cap-add")
-            .arg("SYS_PTRACE")
-            .arg("--security-opt")
-            .arg("seccomp=unconfined")
-            .arg("--pids-limit")
-            .arg("0")
-            .arg("--network")
-            .arg("none")
-            .arg("--entrypoint")
-            .arg("/sb/agent")
-            .arg("-v")
-            .arg(bind_mount_arg(&self.agent_bin, "/sb/agent", "ro"))
-            .arg("-v")
-            .arg(bind_mount_arg(spec_dir.path(), "/sb-in", "ro"))
-            .arg("-v")
-            .arg(bind_mount_arg(out_dir.path(), "/sb-out", "rw"))
-            .arg(reference)
-            .arg("agent")
-            .arg("trace")
-            .arg("--rootfs")
-            .arg("/")
-            .arg("--spec")
-            .arg("/sb-in/spec.json")
-            .arg("--output")
-            .arg("/sb-out")
-            .arg("--trace-backend")
-            .arg("ptrace");
-        let create_out = create_cmd
-            .output()
-            .context("failed to create agent container")?;
-        if !create_out.status.success() {
-            let stderr = String::from_utf8_lossy(&create_out.stderr);
-            bail!("agent container create failed: {}", stderr.trim());
-        }
-
-        let config = self.inspect_container_config(&container_name)?;
-        let spec = build_agent_trace_spec(entries, &config);
-        let spec_data =
-            serde_json::to_vec_pretty(&spec).context("failed to serialize agent trace spec")?;
-        fs::write(spec_dir.path().join("spec.json"), spec_data)
-            .context("failed to write agent trace spec")?;
-
-        debug!(
-            "spawning agent trace container `{}` via {:?}",
-            container_name, self.runtime_cmd
-        );
-        let mut start_cmd = self.base_command();
-        start_cmd.arg("start").arg("-a").arg(&container_name);
-        let start_status = start_cmd
-            .status()
-            .context("failed to start agent container")?;
-        if !start_status.success() {
-            let _ = self.base_command().arg("rm").arg(&container_name).status();
-            bail!("agent container `{container_name}` exited with status {start_status}");
-        }
-
-        let export_tar = export_dir.path().join("rootfs.tar");
-        let tar_file = File::create(&export_tar).context("failed to create agent export tar")?;
-        let mut export_cmd = self.base_command();
-        export_cmd
-            .arg("export")
-            .arg(&container_name)
-            .stdout(Stdio::from(tar_file));
-        let export_status = export_cmd
-            .status()
-            .context("failed to export agent container")?;
-        if !export_status.success() {
-            let _ = self.base_command().arg("rm").arg(&container_name).status();
-            bail!("agent container export failed for `{container_name}`");
-        }
-
-        let unpack_status = Command::new("tar")
-            .arg("-C")
-            .arg(export_dir.path())
-            .arg("-xf")
-            .arg(&export_tar)
-            .status()
-            .context("failed to unpack agent rootfs")?;
-        if !unpack_status.success() {
-            let _ = self.base_command().arg("rm").arg(&container_name).status();
-            bail!("failed to unpack exported rootfs");
-        }
-        let _ = fs::remove_file(&export_tar);
-        let _ = self.base_command().arg("rm").arg(&container_name).status();
-
-        let report_data =
-            fs::read(out_dir.path().join("report.json")).context("failed to read agent report")?;
-        let report: TraceSpecReport =
-            serde_json::from_slice(&report_data).context("failed to parse agent report")?;
-        if self.keep_output {
-            #[allow(deprecated)]
-            let preserved = out_dir.into_path();
-            info!(
-                "agent trace output for image `{}` preserved at {}",
-                reference,
-                preserved.display()
-            );
-        }
-
-        Ok(AgentRunResult {
-            report,
-            rootfs: export_dir,
-            config,
-        })
-    }
-
-    fn inspect_container_config(&self, container: &str) -> Result<ImageConfig> {
-        let mut cmd = self.base_command();
-        cmd.arg("inspect")
-            .arg(container)
-            .arg("--format")
-            .arg("{{json .Config}}");
-        let output = cmd
-            .output()
-            .context("failed to inspect agent container config")?;
-        if !output.status.success() {
-            bail!(
-                "agent container inspect failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let cfg: DockerContainerConfig = serde_json::from_slice(&output.stdout)
-            .context("failed to decode container config json")?;
-        Ok(cfg.into_image_config())
-    }
-
-    fn base_command(&self) -> Command {
-        let mut command = Command::new(&self.runtime_cmd[0]);
-        for arg in &self.runtime_cmd[1..] {
-            command.arg(arg);
-        }
-        command
-    }
-}
-
-#[derive(Deserialize)]
-struct DockerContainerConfig {
-    #[serde(rename = "Env")]
-    env: Option<Vec<String>>,
-    #[serde(rename = "WorkingDir")]
-    working_dir: Option<String>,
-    #[serde(rename = "Entrypoint")]
-    entrypoint: Option<Vec<String>>,
-    #[serde(rename = "Cmd")]
-    cmd: Option<Vec<String>>,
-}
-
-impl DockerContainerConfig {
-    fn into_image_config(self) -> ImageConfig {
-        ImageConfig {
-            workdir: self
-                .working_dir
-                .filter(|dir| !dir.is_empty())
-                .map(PathBuf::from),
-            entrypoint: self.entrypoint.unwrap_or_default(),
-            cmd: self.cmd.unwrap_or_default(),
-            env: self.env.unwrap_or_default(),
-        }
-    }
-}
-
-fn bind_mount_arg(source: &Path, target: &str, mode: &str) -> OsString {
-    let mut value = OsString::new();
-    value.push(source.as_os_str());
-    value.push(":");
-    value.push(target);
-    if !mode.is_empty() {
-        value.push(":");
-        value.push(mode);
-    }
-    value
-}
-
-fn sanitize_reference(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
-            _ => '-',
-        })
-        .collect()
-}
-
-fn current_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn log_closure_stats(label: &str, closure: &DependencyClosure) {

@@ -1278,6 +1278,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "pathdiff",
  "serde",
  "serde_json",
  "sha2",
