@@ -1,14 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use libc;
 use serde::Deserialize;
-use sidebundle_core::{AuxvEntry, RuntimeMetadata};
+use sidebundle_core::RuntimeMetadata;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use userland_execve::{exec_with_options, AuxSnapshot, ExecOptions};
 
 fn main() {
     if let Err(err) = run() {
@@ -45,24 +43,13 @@ fn run() -> Result<()> {
         unreachable!();
     }
 
-    let mut options = ExecOptions::new(&entry_path);
-    options.args(argv.iter().map(|arg| arg.as_c_str()));
-    options.env_pairs(env_block.iter().map(|pair| pair.as_c_str()));
-
     let linker = config
         .linker
         .as_ref()
         .map(|rel| bundle_root.join(rel))
         .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-    options.override_interpreter(Some(linker));
-
-    if let Some(metadata) = config.metadata.as_ref() {
-        if let Some(snapshot) = build_aux_snapshot(metadata) {
-            options.aux_snapshot(snapshot);
-        }
-    }
-
-    exec_with_options(options);
+    exec_dynamic(&linker, &entry_path, &argv, &env_block)?;
+    unreachable!();
 }
 
 #[derive(Deserialize)]
@@ -124,22 +111,6 @@ fn build_env_block(bundle_root: &Path, config: &LauncherConfig) -> Result<Vec<CS
     Ok(block)
 }
 
-fn build_aux_snapshot(metadata: &RuntimeMetadata) -> Option<AuxSnapshot> {
-    let sanitized = sanitize_metadata(metadata);
-    if sanitized.auxv.is_empty() && sanitized.platform.is_none() && sanitized.random.is_none() {
-        return None;
-    }
-    let entries = sanitized
-        .auxv
-        .iter()
-        .map(|AuxvEntry { key, value }| (*key, *value))
-        .collect();
-    let snapshot = AuxSnapshot::new(entries)
-        .with_platform(sanitized.platform.clone())
-        .with_random(sanitized.random);
-    Some(snapshot)
-}
-
 fn os_to_cstring(value: &OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|err| anyhow!("invalid string: {err}"))
 }
@@ -162,19 +133,31 @@ fn exec_static(entry: &Path, argv: &[CString], envp: &[CString]) -> Result<()> {
         .with_context(|| format!("execve failed for {}", entry.display()))
 }
 
-fn sanitize_metadata(meta: &RuntimeMetadata) -> RuntimeMetadata {
-    let mut sanitized = meta.clone();
-    sanitized.platform = Some("x86_64".to_string());
-    sanitized.auxv = sanitized
-        .auxv
-        .iter()
-        .map(|entry| {
-            let mut clone = entry.clone();
-            if clone.key == libc::AT_HWCAP as u64 || clone.key == libc::AT_HWCAP2 as u64 {
-                clone.value = 0;
-            }
-            clone
-        })
-        .collect();
-    sanitized
+fn exec_dynamic(linker: &Path, entry: &Path, argv: &[CString], envp: &[CString]) -> Result<()> {
+    use std::ptr;
+
+    let linker_cstr = os_to_cstring(linker.as_os_str())?;
+    let entry_cstr = os_to_cstring(entry.as_os_str())?;
+
+    let mut argv_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 2);
+    argv_ptrs.push(linker_cstr.as_ptr());
+    argv_ptrs.push(entry_cstr.as_ptr());
+    for arg in argv.iter().skip(1) {
+        argv_ptrs.push(arg.as_ptr());
+    }
+    argv_ptrs.push(ptr::null());
+
+    let mut env_ptrs: Vec<*const libc::c_char> = envp.iter().map(|env| env.as_ptr()).collect();
+    env_ptrs.push(ptr::null());
+
+    unsafe {
+        libc::execve(linker_cstr.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    }
+    Err(std::io::Error::last_os_error()).with_context(|| {
+        format!(
+            "execve failed for linker {} (entry {})",
+            linker.display(),
+            entry.display()
+        )
+    })
 }
