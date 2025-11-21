@@ -113,6 +113,12 @@ impl BundleValidator {
                 };
             }
             Err(err) => {
+                if matches!(err, LinkerError::UnsupportedStub { .. }) {
+                    validation.status = EntryValidationStatus::LinkerSkipped {
+                        reason: err.to_string(),
+                    };
+                    return validation;
+                }
                 validation.status = EntryValidationStatus::LinkerError {
                     error: LinkerFailure::from(err),
                 };
@@ -163,6 +169,12 @@ impl BundleValidator {
                 };
             }
             Err(err) => {
+                if matches!(err, LinkerError::UnsupportedStub { .. }) {
+                    validation.status = EntryValidationStatus::LinkerSkipped {
+                        reason: err.to_string(),
+                    };
+                    return validation;
+                }
                 validation.status = EntryValidationStatus::LinkerError {
                     error: LinkerFailure::from(err),
                 };
@@ -218,6 +230,7 @@ pub struct EntryValidation {
 pub enum EntryValidationStatus {
     StaticOk,
     DynamicOk { resolved: usize },
+    LinkerSkipped { reason: String },
     MissingBinary,
     MissingLinker,
     MissingInterpreter,
@@ -228,7 +241,9 @@ impl EntryValidationStatus {
     pub fn is_success(&self) -> bool {
         matches!(
             self,
-            EntryValidationStatus::StaticOk | EntryValidationStatus::DynamicOk { .. }
+            EntryValidationStatus::StaticOk
+                | EntryValidationStatus::DynamicOk { .. }
+                | EntryValidationStatus::LinkerSkipped { .. }
         )
     }
 }
@@ -254,6 +269,10 @@ pub enum LinkerFailure {
     Other {
         message: String,
     },
+    UnsupportedStub {
+        linker: PathBuf,
+        message: String,
+    },
 }
 
 impl From<LinkerError> for LinkerFailure {
@@ -276,6 +295,10 @@ impl From<LinkerError> for LinkerFailure {
                 LinkerFailure::LibraryNotFound { name, raw }
             }
             LinkerError::InvalidPath(path) => LinkerFailure::InvalidPath { path },
+            LinkerError::UnsupportedStub { linker, message } => LinkerFailure::UnsupportedStub {
+                linker,
+                message,
+            },
         }
     }
 }
@@ -283,6 +306,7 @@ impl From<LinkerError> for LinkerFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sidebundle_core::{BinaryEntryPlan, EntryBundlePlan, Origin};
     use std::fs;
     use tempfile::tempdir;
 
@@ -316,7 +340,12 @@ mod tests {
         let validator = BundleValidator::new();
         let tmp = tempdir().unwrap();
         let plan = dummy_plan(false);
-        let binary_path = tmp.path().join(&plan.binary_destination);
+        let binary_path = tmp.path().join(
+            match &plan {
+                EntryBundlePlan::Binary(inner) => &inner.binary_destination,
+                _ => unreachable!(),
+            },
+        );
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"#!/bin/true\n").unwrap();
         let report = validator.validate_with_report(tmp.path(), &[plan]);

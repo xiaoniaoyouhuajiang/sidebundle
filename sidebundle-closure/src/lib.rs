@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use linker::{LibraryResolution, LinkerError, LinkerRunner};
+use linker::{is_gcompat_stub_binary, LibraryResolution, LinkerError, LinkerRunner};
 use log::debug;
 use sha2::{Digest, Sha256};
 use shell_words;
@@ -57,6 +57,12 @@ const GPU_LIB_PREFIXES: &[&str] = &[
     "libnvoptix",
     "libopenvr",
     "libxnvctrl",
+];
+
+const HOST_GLIBC_LINKERS: &[&str] = &[
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    "/lib/ld-linux-x86-64.so.2",
 ];
 
 struct ShebangSpec {
@@ -338,11 +344,20 @@ impl ClosureBuilder {
         }
 
         let mut files = Vec::new();
+        let mut seen_destinations: HashSet<PathBuf> = HashSet::new();
         for (source, destination) in file_map.into_iter() {
             if let Some(reason) = classify_high_risk_asset(&source) {
                 debug!(
                     "omitting {} from closure (filtered: {reason})",
                     source.display()
+                );
+                continue;
+            }
+            if !seen_destinations.insert(destination.clone()) {
+                debug!(
+                    "omitting {} from closure (destination {} already populated)",
+                    source.display(),
+                    destination.display()
                 );
                 continue;
             }
@@ -565,7 +580,7 @@ impl ClosureBuilder {
         let entry_metadata = self.load_metadata(entry_source, cache)?;
         let entry_dest = ensure_file(resolver, files, aliases, entry_source, None);
 
-        let (interpreter_source, interpreter_dest, is_static) =
+        let (mut interpreter_source, mut interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
                 Some(path) => {
                     let canonical = canonicalize(&path, resolver.trace_root())?;
@@ -574,7 +589,6 @@ impl ClosureBuilder {
                 }
                 None => (None, None, true),
             };
-
         let mut lib_dirs: BTreeSet<PathBuf> = BTreeSet::new();
         if let Some(dir) = entry_dest.parent() {
             lib_dirs.insert(dir.to_path_buf());
@@ -639,6 +653,55 @@ impl ClosureBuilder {
 
         let libraries: Vec<PathBuf> = lib_dirs.into_iter().collect();
         let binary_destination = entry_dest.clone();
+        let mut requires_linker = !is_static;
+        if let Some(linker_path) = interpreter_source.clone() {
+            match is_gcompat_stub_binary(&linker_path) {
+                Ok(true) => {
+                    if let Some(host_ld) = Self::find_host_glibc_linker() {
+                        warn!(
+                            "detected gcompat linker stub at {}; substituting host glibc linker {}",
+                            linker_path.display(),
+                            host_ld.display()
+                        );
+                        let stub_source = linker_path.clone();
+                        let desired_dest = files.remove(&stub_source).unwrap_or_else(|| {
+                            let mut dest = PathBuf::from("payload");
+                            for comp in Path::new("/lib/ld-linux-x86-64.so.2").components().skip(1)
+                            {
+                                dest.push(comp.as_os_str());
+                            }
+                            dest
+                        });
+                        debug!(
+                            "gcompat replacement: removing stub {} -> {}, inserting host {}",
+                            stub_source.display(),
+                            desired_dest.display(),
+                            host_ld.display()
+                        );
+                        files.insert(host_ld.clone(), desired_dest.clone());
+                        interpreter_source = Some(host_ld.clone());
+                        interpreter_dest = Some(desired_dest);
+                        debug!(
+                            "gcompat replacement: interpreter_source={}, interpreter_dest={}",
+                            host_ld.display(),
+                            interpreter_dest.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())
+                        );
+                        requires_linker = true;
+                    } else {
+                        warn!(
+                            "detected gcompat linker stub at {}; no host glibc linker found, launcher will exec binary directly (may fail)",
+                            linker_path.display()
+                        );
+                        requires_linker = false;
+                    }
+                }
+                Err(err) => warn!(
+                    "failed to inspect linker {} for gcompat stub: {err}",
+                    linker_path.display()
+                ),
+                _ => {}
+            }
+        }
         Ok(BinaryEntryPlan {
             display_name: display_name.to_string(),
             binary_source: entry_source.to_path_buf(),
@@ -646,7 +709,7 @@ impl ClosureBuilder {
             linker_source: interpreter_source.unwrap_or_else(|| entry_source.to_path_buf()),
             linker_destination: interpreter_dest.unwrap_or_else(|| binary_destination.clone()),
             library_dirs: libraries,
-            requires_linker: !is_static,
+            requires_linker,
             origin: origin.clone(),
         })
     }
@@ -867,6 +930,7 @@ impl ClosureBuilder {
         paths
     }
 
+
     fn resolve_additional_paths(
         resolver: &dyn PathResolver,
         origin: &Origin,
@@ -914,12 +978,23 @@ impl ClosureBuilder {
         if metadata.needed.is_empty() {
             return Ok(Vec::new());
         }
-        self.runner
-            .trace_dependencies(linker, subject, search_paths)
-            .map_err(|source| ClosureError::LinkerTrace {
-                path: subject.to_path_buf(),
-                source,
-            })
+        match self.runner.trace_dependencies(linker, subject, search_paths) {
+            Ok(resolved) => Ok(resolved),
+            Err(linker_err) => {
+                if matches!(linker_err, linker::LinkerError::UnsupportedStub { .. }) {
+                    warn!(
+                        "linker trace skipped for {} (unsupported stub: {})",
+                        subject.display(),
+                        linker_err
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(ClosureError::LinkerTrace {
+                    path: subject.to_path_buf(),
+                    source: linker_err,
+                })
+            }
+        }
     }
 
     fn split_paths(value: &str) -> Vec<PathBuf> {
@@ -928,6 +1003,24 @@ impl ClosureBuilder {
             .filter(|segment| !segment.trim().is_empty())
             .map(PathBuf::from)
             .collect()
+    }
+
+    fn find_host_glibc_linker() -> Option<PathBuf> {
+        for candidate in HOST_GLIBC_LINKERS {
+            let path = PathBuf::from(candidate);
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    if let Ok(is_stub) = is_gcompat_stub_binary(&path) {
+                        if is_stub {
+                            continue;
+                        }
+                    }
+                    return Some(path);
+                }
+                _ => continue,
+            }
+        }
+        None
     }
 
     fn trace_command_for(

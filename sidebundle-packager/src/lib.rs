@@ -586,7 +586,7 @@ fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), Packager
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{BundleSpec, DependencyClosure, EntryBundlePlan, TargetTriple};
+    use sidebundle_core::{BundleSpec, DependencyClosure, TargetTriple};
 
     #[test]
     fn empty_closure_rejected() {

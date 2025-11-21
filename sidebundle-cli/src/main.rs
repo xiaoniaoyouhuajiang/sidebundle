@@ -1164,7 +1164,9 @@ fn parse_image_env(vars: &[String]) -> Vec<(OsString, OsString)> {
 fn log_validation_report(report: &ValidationReport) {
     for entry in &report.entries {
         match entry.status {
-            EntryValidationStatus::StaticOk | EntryValidationStatus::DynamicOk { .. } => {
+            EntryValidationStatus::StaticOk
+            | EntryValidationStatus::DynamicOk { .. }
+            | EntryValidationStatus::LinkerSkipped { .. } => {
                 info!(
                     "validation ok: {} ({})",
                     entry.display_name,
@@ -1286,6 +1288,9 @@ fn describe_status(status: &EntryValidationStatus) -> String {
         EntryValidationStatus::DynamicOk { resolved } => {
             format!("dynamic entry (resolved {} libs)", resolved)
         }
+        EntryValidationStatus::LinkerSkipped { reason } => {
+            format!("linker validation skipped ({reason})")
+        }
         EntryValidationStatus::MissingBinary => "binary missing".to_string(),
         EntryValidationStatus::MissingInterpreter => "interpreter missing".to_string(),
         EntryValidationStatus::MissingLinker => "linker missing".to_string(),
@@ -1309,6 +1314,11 @@ fn describe_status(status: &EntryValidationStatus) -> String {
             LinkerFailure::InvalidPath { path } => {
                 format!("invalid path {}", path.display())
             }
+            LinkerFailure::UnsupportedStub { linker, message } => format!(
+                "linker {} unsupported stub: {}",
+                linker.display(),
+                message
+            ),
             LinkerFailure::Other { message } => message.clone(),
         },
     }
