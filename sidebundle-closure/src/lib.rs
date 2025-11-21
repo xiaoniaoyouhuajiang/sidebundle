@@ -21,7 +21,7 @@ use sidebundle_core::{
     ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ScriptEntryPlan, TracedFile,
 };
 use thiserror::Error;
-
+use regex::Regex;
 const DEFAULT_LIBRARY_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
@@ -203,6 +203,7 @@ impl Default for ResolverSet {
 pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
+    origin_paths: HashMap<Origin, Vec<PathBuf>>,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     resolvers: ResolverSet,
@@ -220,6 +221,7 @@ impl ClosureBuilder {
                 .iter()
                 .map(|dir| PathBuf::from(dir))
                 .collect(),
+            origin_paths: HashMap::new(),
             runner: LinkerRunner::new(),
             tracer: None,
             resolvers: ResolverSet::new(),
@@ -239,6 +241,11 @@ impl ClosureBuilder {
 
     pub fn with_tracer(mut self, tracer: trace::TraceCollector) -> Self {
         self.tracer = Some(tracer);
+        self
+    }
+
+    pub fn with_origin_path(mut self, origin: Origin, path: Vec<PathBuf>) -> Self {
+        self.origin_paths.insert(origin, path);
         self
     }
 
@@ -546,7 +553,7 @@ impl ClosureBuilder {
                     entry_source,
                     runtime_alias.as_deref(),
                 );
-                Ok(EntryBundlePlan::Script(ScriptEntryPlan {
+                let plan = ScriptEntryPlan {
                     display_name: display_name.to_string(),
                     script_source: entry_source.to_path_buf(),
                     script_destination,
@@ -558,7 +565,18 @@ impl ClosureBuilder {
                     library_dirs: interpreter_plan.library_dirs.clone(),
                     requires_linker: interpreter_plan.requires_linker,
                     origin: origin.clone(),
-                }))
+                };
+                if Self::is_bash_interpreter(&plan.interpreter_source) {
+                    self.collect_bash_dependencies(
+                        resolver,
+                        origin,
+                        entry_source,
+                        files,
+                        aliases,
+                        cache,
+                    );
+                }
+                Ok(EntryBundlePlan::Script(plan))
             }
             Err(source) => Err(ClosureError::ElfParse {
                 path: entry_source.to_path_buf(),
@@ -835,7 +853,11 @@ impl ClosureBuilder {
         if candidate.components().count() > 1 || candidate.is_absolute() {
             return self.resolve_in_origin(resolver, origin, &candidate);
         }
-        let search_paths = self.shebang_path_entries();
+        let search_paths = self
+            .origin_paths
+            .get(origin)
+            .cloned()
+            .unwrap_or_else(|| self.shebang_path_entries());
         for dir in search_paths {
             let joined = dir.join(command);
             if let Some(resolved) = self.resolve_in_origin(resolver, origin, &joined) {
@@ -864,6 +886,7 @@ impl ClosureBuilder {
         env::var("PATH")
             .ok()
             .map(|value| Self::split_paths(&value))
+            .filter(|paths| !paths.is_empty())
             .unwrap_or_else(|| {
                 DEFAULT_SHEBANG_PATHS
                     .iter()
@@ -968,6 +991,104 @@ impl ClosureBuilder {
         name.starts_with("linux-vdso") || name.starts_with("ld-linux")
     }
 
+    fn is_bash_interpreter(interpreter: &Path) -> bool {
+        interpreter
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "bash" || n == "sh")
+            .unwrap_or(false)
+    }
+
+    fn collect_bash_dependencies(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        script: &Path,
+        files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+        cache: &mut HashMap<PathBuf, ElfMetadata>,
+    ) {
+        let commands = Self::scan_bash_commands(script);
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        for cmd in commands {
+            if let Some(resolved) = self.resolve_command(resolver, origin, &cmd) {
+                if !visited.insert(resolved.clone()) {
+                    continue;
+                }
+                let _ = self.build_binary_plan(
+                    resolver,
+                    origin,
+                    &resolved,
+                    &cmd,
+                    files,
+                    aliases,
+                    cache,
+                );
+            }
+        }
+    }
+
+    fn scan_bash_commands(script: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(data) = fs::read_to_string(script) else {
+            return out;
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        let re_line = Regex::new(r"(?m)^[ \t]*([A-Za-z0-9_./-]+)").unwrap();
+        let re_dollar = Regex::new(r"\$\(\s*([A-Za-z0-9_./-]+)").unwrap();
+        let re_backtick = Regex::new(r"`\s*([A-Za-z0-9_./-]+)").unwrap();
+        let re_pipe = Regex::new(r"\|\s*([A-Za-z0-9_./-]+)").unwrap();
+        let re_abs = Regex::new(r"(/[-A-Za-z0-9_./]+)").unwrap();
+        let keywords = [
+            "if", "then", "fi", "for", "do", "done", "elif", "else", "while", "case", "esac",
+            "function", "in",
+        ];
+        for caps in re_line.captures_iter(&data) {
+            if let Some(mat) = caps.get(1) {
+                let token = mat.as_str();
+                if keywords.iter().any(|k| *k == token) {
+                    continue;
+                }
+                if seen.insert(token.to_string()) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        for caps in re_dollar.captures_iter(&data) {
+            if let Some(mat) = caps.get(1) {
+                let token = mat.as_str();
+                if seen.insert(token.to_string()) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        for caps in re_backtick.captures_iter(&data) {
+            if let Some(mat) = caps.get(1) {
+                let token = mat.as_str();
+                if seen.insert(token.to_string()) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        for caps in re_pipe.captures_iter(&data) {
+            if let Some(mat) = caps.get(1) {
+                let token = mat.as_str();
+                if seen.insert(token.to_string()) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        for caps in re_abs.captures_iter(&data) {
+            if let Some(mat) = caps.get(1) {
+                let token = mat.as_str();
+                if seen.insert(token.to_string()) {
+                    out.push(token.to_string());
+                }
+            }
+        }
+        out
+    }
+
     fn trace_with_linker(
         &self,
         linker: &Path,
@@ -997,7 +1118,7 @@ impl ClosureBuilder {
         }
     }
 
-    fn split_paths(value: &str) -> Vec<PathBuf> {
+    pub fn split_paths(value: &str) -> Vec<PathBuf> {
         value
             .split(':')
             .filter(|segment| !segment.trim().is_empty())
@@ -1254,6 +1375,7 @@ pub enum ClosureError {
 mod tests {
     use super::*;
     use sidebundle_core::{BundleSpec, TargetTriple};
+    use std::collections::HashSet as TestHashSet;
 
     #[test]
     fn closure_collects_host_binary() {
@@ -1314,5 +1436,18 @@ mod tests {
             Some("gpu-driver"),
             "expected libcuda to be filtered"
         );
+    }
+
+    #[test]
+    fn scan_bash_commands_finds_literal_invocations() {
+        let script = Path::new("tests/fixtures/scip-java");
+        let commands = ClosureBuilder::scan_bash_commands(script);
+        let set: TestHashSet<_> = commands.into_iter().collect();
+        for expected in ["coursier", "java", "jq", "tr", "/app/scip-java"] {
+            assert!(
+                set.contains(expected),
+                "expected bash scanner to find {expected}"
+            );
+        }
     }
 }

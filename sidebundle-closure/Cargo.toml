@@ -20,5 +20,6 @@ tempfile = "3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shell-words = "1.1"
+regex = "1"
 
 [dev-dependencies]

@@ -911,6 +911,15 @@ fn build_closure_from_root(
         }
         builder = builder.with_tracer(tracer);
     }
+    if let Some(path_value) = image_env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+    {
+        let path_entries: Vec<PathBuf> =
+            ClosureBuilder::split_paths(&path_value.to_string_lossy());
+        builder = builder.with_origin_path(origin.clone(), path_entries);
+    }
 
     let mut closure = builder
         .build(&spec)
