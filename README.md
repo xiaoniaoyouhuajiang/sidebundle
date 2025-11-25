@@ -6,6 +6,16 @@ sidebundle builds relocatable bundles from dynamically linked ELF binaries. The 
 executables from the host filesystem or from OCI images (Docker/Podman), trace the files that are
 loaded at runtime, and emit a portable directory tree with launchers and a manifest.
 
+![head](./statics/header_n.webp)
+
+With sidebundle, you can:
+* Automatically shrink Docker images and run the output on any Linux host without a container runtime.
+* Bundle multiple ELF dependencies of an app/workflow into a single portable bundle.
+
+## Before & after
+`scip-index` bundle size comparison
+![compare](./statics/compares.png)
+
 ## Features
 - Bundle binaries that live on the host or inside an OCI image.
 - Resolve shared library dependencies statically and via runtime tracing (ptrace/fanotify).
@@ -39,6 +49,38 @@ The CLI exposes contextual help:
 sidebundle --help
 sidebundle create --help
 ```
+
+## Quick start (static binary)
+Grab the prebuilt musl-linked binary from GitHub Releases (e.g. `sidebundle-musl-x86_64`). It runs on
+any modern Linux without extra dependencies.
+
+### Scenario A: Ship a Python script to machines without Python
+Assume your script has a proper shebang (e.g. `#!/usr/bin/env python3`):
+
+```bash
+./sidebundle-musl-x86_64 create \
+  --name hello-py \
+  --from-host "./examples/hello.py" \
+  --out-dir bundles \
+  --trace-backend combined \
+  --log-level info
+```
+
+`hello-py/bin/hello.py` will run Python from the bundle, even on hosts without Python installed.
+
+### Scenario B: Extract `jq` from an Alpine image to run on Ubuntu
+
+```bash
+./sidebundle-musl-x86_64 create \
+  --name jq-alpine \
+  --from-image "docker://alpine:3.20::/usr/bin/jq::trace=--version" \
+  --out-dir bundles \
+  --image-trace-backend agent-combined \
+  --log-level info
+```
+
+The resulting `jq-alpine/bin/jq` is a portable launcher that uses the bundled libs; Docker is only
+needed at build time.
 
 ## Bundle layout
 A successful build writes `target/bundles/<name>` (customizable via `--out-dir`). Each bundle looks
@@ -191,6 +233,23 @@ Ship the entire bundle directory to another host and execute `bin/<entry>`.
   artifacts (`traced_files`) with their digests for auditing.
 - Traced payload: every runtime-only file is stored under `resources/traced`, preserving the original
   logical path so you can see what the trace engine actually touched.
+
+## How sidebundle collects dependencies
+
+```
+Sources:
+  - Host entries (--from-host)       -> Chroot/host resolver -> ELF/shebang parse -> static deps
+  - Image entries (--from-image)     -> Export rootfs or run agent inside container
+
+Static phase:
+  Parse ELF (DT_NEEDED) / shebang -> resolve interpreter -> copy binaries/libs into payload
+
+Runtime trace (optional):
+  ptrace/fanotify/agent(-combined) -> collect exec/open paths -> promote ELF/resources into closure
+
+Packaging:
+  Deduplicate files -> link into payload/data -> write manifest.lock -> emit launchers
+```
 
 ## Testing and development
 Run the usual Rust workflow while hacking on the project:

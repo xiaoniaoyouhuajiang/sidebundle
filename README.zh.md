@@ -4,6 +4,16 @@
 
 sidebundle 用于从动态链接的 ELF 可执行文件构建可迁移的离线包。CLI 可以从宿主机或 OCI 镜像（Docker/Podman）采集可执行文件，静态解析和运行时跟踪它们加载的文件，并生成可移植的目录结构（附启动器和 manifest）。
 
+![head](./statics/header_n.webp)
+
+依靠sidebundle，你能：
+* 自动最小化Docker镜像，且无需runc等runtime即可在任意linux上运行
+* 将软件/工作流依赖的多个elf打包成一个可迁移的bundle
+
+## 效果演示
+scip-index应用打包前后占用空间对比
+![对比](./statics/compares.png)
+
 ## 特性
 - 打包来自宿主机或 OCI 镜像的可执行文件。
 - 通过静态分析与运行时跟踪（ptrace/fanotify）解析依赖。
@@ -32,6 +42,36 @@ CLI 提供上下文帮助：
 sidebundle --help
 sidebundle create --help
 ```
+
+## 快速开始（使用 musl 静态二进制）
+从 GitHub Releases 获取预编译的 musl 静态版（如 `sidebundle-musl-x86_64`），无需额外依赖即可运行。
+
+### 场景 A：打包 Python 脚本到无 Python 的机器
+确保脚本带有正确的 shebang（如 `#!/usr/bin/env python3`），然后：
+
+```bash
+./sidebundle-musl-x86_64 create \
+  --name hello-py \
+  --from-host "./examples/hello.py" \
+  --out-dir bundles \
+  --trace-backend combined \
+  --log-level info
+```
+
+得到的 `hello-py/bin/hello.py` 会使用 bundle 内的 Python，在未安装 Python 的主机上也能运行。
+
+### 场景 B：从 Alpine 镜像提取 `jq` 在 Ubuntu 上运行
+
+```bash
+./sidebundle-musl-x86_64 create \
+  --name jq-alpine \
+  --from-image "docker://alpine:3.20::/usr/bin/jq::trace=--version" \
+  --out-dir bundles \
+  --image-trace-backend agent-combined \
+  --log-level info
+```
+
+输出的 `jq-alpine/bin/jq` 为可移植启动器，运行时不再依赖 Docker（仅构建时需要）。
 
 ## Bundle 布局
 构建成功后会写入 `target/bundles/<name>`（可通过 `--out-dir` 自定义）：
@@ -165,6 +205,23 @@ sidebundle agent trace \
 - 日志：使用 `--log-level debug` 查看解析/合并/验证细节。
 - manifest：`manifest.lock` 包含复制的依赖 (`files`) 与运行时跟踪的文件 (`traced_files`) 及其摘要。
 - 跟踪产物：运行时文件保存在 `resources/traced`，保留原始逻辑路径，便于审计。
+
+## sidebundle 如何收集依赖
+
+```
+来源：
+  - 宿主入口 (--from-host)   -> chroot/host 解析 -> ELF/shebang 解析 -> 静态依赖
+  - 镜像入口 (--from-image)  -> 导出 rootfs 或在容器内运行 agent
+
+静态阶段：
+  解析 ELF (DT_NEEDED) / shebang -> 解析解释器 -> 复制二进制/库到 payload
+
+运行时跟踪（可选）：
+  ptrace/fanotify/agent(-combined) -> 收集 exec/open 路径 -> 提升 ELF/资源到闭包
+
+打包：
+  文件去重 -> 链接到 payload/data -> 写 manifest.lock -> 生成启动器
+```
 
 ## 开发与测试
 
