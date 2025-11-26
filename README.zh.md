@@ -157,6 +157,7 @@ sidebundle create \
 - `--image-agent-cli CMD`：自定义容器引擎命令（如 `"sudo -n podman"`）。
 - `--image-agent-keep-output`：保留 agent 生成的临时输出便于调试。
 - `--image-agent-keep-rootfs`：保留 agent 导出的 rootfs 便于检查。
+- `--allow-gpu-libs`：允许将 GPU/DRM 相关库（如 libdrm/libnvidia 等）打包，不再过滤。
 - `--strict-validate`：链接器验证失败时中止构建。
 - `--log-level`：日志级别（`error`、`warn`、`info`、`debug`、`trace`）。
 
@@ -205,6 +206,15 @@ sidebundle agent trace \
 - 日志：使用 `--log-level debug` 查看解析/合并/验证细节。
 - manifest：`manifest.lock` 包含复制的依赖 (`files`) 与运行时跟踪的文件 (`traced_files`) 及其摘要。
 - 跟踪产物：运行时文件保存在 `resources/traced`，保留原始逻辑路径，便于审计。
+
+## 特殊场景与提示
+
+- **fanotify 跟踪“卡住”**：fanotify 监听文件事件，如果命令卡死，多数是其他进程占用了相关文件/目录或有额外监视导致未能退出。检查是否有其他文件监控程序，必要时换用更简单的命令或切换到 `ptrace/combined`。
+- **高风险资产过滤**：sidebundle 会过滤部分 GPU/DRM 相关库（如 `libdrm`、`libnvidia*`），以避免打包宿主驱动。若你的场景需要这些库（例如 ffmpeg 使用 DRM/VAAPI/NVENC），请加 `--allow-gpu-libs` 放行，并确保目标环境有匹配的设备/驱动。
+- **trace 参数在宿主/镜像中的区别**：
+  - 宿主：`--trace-backend` 支持 `off|auto|ptrace|fanotify|combined`。
+  - 镜像：`--image-trace-backend` 支持上述选项，另外有 `agent|agent-combined` 在容器内运行跟踪。Agent 模式需 Docker/Podman 提供 `SYS_PTRACE`/`SYS_ADMIN` 和 `seccomp=unconfined`。
+  JVM 这类通过 `dlopen` 加载库的场景，推荐 `combined`/`agent-combined` 捕获完整依赖。
 
 ## sidebundle 如何收集依赖
 

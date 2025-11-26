@@ -74,6 +74,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         image_agent_cli,
         image_agent_keep_output,
         image_agent_keep_rootfs,
+        allow_gpu_libs,
         strict_validate,
     } = args;
 
@@ -134,7 +135,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         let resolver = Arc::new(ChrootPathResolver::from_root(root.clone(), Origin::Host));
         host_resolvers.insert(Origin::Host, resolver);
     }
-    let mut builder = ClosureBuilder::new().with_resolver_set(host_resolvers.clone());
+    let mut builder = ClosureBuilder::new()
+        .with_resolver_set(host_resolvers.clone())
+        .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(backend) = host_backend.clone() {
         let tracer = TraceCollector::new().with_backend(backend);
         builder = builder.with_tracer(tracer);
@@ -166,6 +169,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             target,
             image_backend_choice,
             agent_launch.as_ref(),
+            allow_gpu_libs,
         )
         .with_context(|| {
             format!("failed to build closure for image `{reference}` using backend {preference:?}")
@@ -365,6 +369,10 @@ struct CreateArgs {
     /// Optional rootfs for linker/tracer chroot
     #[arg(long = "trace-root", value_name = "DIR")]
     trace_root: Option<PathBuf>,
+
+    /// Allow GPU/DRM libraries (e.g., libdrm, libnvidia) to be included in the bundle
+    #[arg(long = "allow-gpu-libs")]
+    allow_gpu_libs: bool,
 
     /// Runtime trace backend for host inputs
     #[arg(long = "trace-backend", value_enum, default_value_t = TraceBackendArg::Auto)]
@@ -687,11 +695,12 @@ fn build_image_closure(
     target: TargetTriple,
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
+    allow_gpu_libs: bool,
 ) -> Result<ImageClosureResult> {
     if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
-    if matches!(trace_backend, TraceBackendArg::Agent) {
+    if matches!(trace_backend, TraceBackendArg::Agent | TraceBackendArg::AgentCombined) {
         let launch = agent_launch
             .ok_or_else(|| anyhow::anyhow!("agent backend requires --image-agent-* options"))?;
         let attempts: Vec<BackendPreference> = match preference {
@@ -707,6 +716,7 @@ fn build_image_closure(
                 target,
                 launch,
                 trace_backend,
+                allow_gpu_libs,
             ) {
                 Ok(result) => return Ok(result),
                 Err(err) => errors.push(format!("{backend:?}: {err:?}")),
@@ -731,6 +741,7 @@ fn build_image_closure(
             target,
             trace_backend,
             agent_launch,
+            allow_gpu_libs,
         ) {
             Ok(result) => return Ok(result),
             Err(err) => errors.push(format!("{backend:?}: {err:?}")),
@@ -749,6 +760,7 @@ fn build_with_backend(
     target: TargetTriple,
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
+    allow_gpu_libs: bool,
 ) -> Result<ImageClosureResult> {
     match backend {
         BackendPreference::Docker => {
@@ -765,6 +777,7 @@ fn build_with_backend(
                 entries,
                 trace_backend,
                 agent_launch,
+                allow_gpu_libs,
                 None,
                 None,
             )
@@ -783,6 +796,7 @@ fn build_with_backend(
                 entries,
                 trace_backend,
                 agent_launch,
+                allow_gpu_libs,
                 None,
                 None,
             )
@@ -797,6 +811,7 @@ fn build_agent_image_closure(
     target: TargetTriple,
     launch: &AgentLaunchConfig,
     trace_backend: TraceBackendArg,
+    allow_gpu_libs: bool,
 ) -> Result<ImageClosureResult> {
     let backend_name = match backend {
         BackendPreference::Docker => "docker",
@@ -861,6 +876,7 @@ fn build_agent_image_closure(
         entries,
         TraceBackendArg::Off,
         None,
+        allow_gpu_libs,
         Some(trace_files),
         metadata,
     )
@@ -875,6 +891,7 @@ fn build_closure_from_root(
     entries: &[ImageEntryArg],
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
+    allow_gpu_libs: bool,
     external_traces: Option<Vec<PathBuf>>,
     metadata: Option<RuntimeMetadata>,
 ) -> Result<ImageClosureResult> {
@@ -910,7 +927,9 @@ fn build_closure_from_root(
     let chroot_resolver = Arc::new(ChrootPathResolver::from_image(root.clone(), origin.clone()));
     resolvers.insert(origin.clone(), chroot_resolver.clone());
 
-    let mut builder = ClosureBuilder::new().with_resolver_set(resolvers.clone());
+    let mut builder = ClosureBuilder::new()
+        .with_resolver_set(resolvers.clone())
+        .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(paths) = external_traces {
         builder = builder.with_external_trace_paths(origin.clone(), paths);
     }

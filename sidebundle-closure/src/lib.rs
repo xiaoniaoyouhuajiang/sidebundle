@@ -206,6 +206,7 @@ pub struct ClosureBuilder {
     default_paths: Vec<PathBuf>,
     origin_paths: HashMap<Origin, Vec<PathBuf>>,
     scanned_scripts: RefCell<HashSet<PathBuf>>,
+    allow_gpu_libs: bool,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     resolvers: ResolverSet,
@@ -225,6 +226,7 @@ impl ClosureBuilder {
                 .collect(),
             origin_paths: HashMap::new(),
             scanned_scripts: RefCell::new(HashSet::new()),
+            allow_gpu_libs: false,
             runner: LinkerRunner::new(),
             tracer: None,
             resolvers: ResolverSet::new(),
@@ -244,6 +246,11 @@ impl ClosureBuilder {
 
     pub fn with_tracer(mut self, tracer: trace::TraceCollector) -> Self {
         self.tracer = Some(tracer);
+        self
+    }
+
+    pub fn with_allow_gpu_libs(mut self, allow: bool) -> Self {
+        self.allow_gpu_libs = allow;
         self
     }
 
@@ -356,7 +363,7 @@ impl ClosureBuilder {
         let mut files = Vec::new();
         let mut seen_destinations: HashSet<PathBuf> = HashSet::new();
         for (source, destination) in file_map.into_iter() {
-            if let Some(reason) = classify_high_risk_asset(&source) {
+            if let Some(reason) = self.filter_reason(&source) {
                 debug!(
                     "omitting {} from closure (filtered: {reason})",
                     source.display()
@@ -415,12 +422,12 @@ impl ClosureBuilder {
         if !trace_path_allowed(resolved) {
             return None;
         }
-        if let Some(reason) = classify_high_risk_asset(resolved) {
-            debug!(
-                "skipping traced artifact {} (filtered: {reason})",
-                resolved.display()
-            );
-            return None;
+            if let Some(reason) = self.filter_reason(resolved) {
+                debug!(
+                    "skipping traced artifact {} (filtered: {reason})",
+                    resolved.display()
+                );
+                return None;
         }
         let host_path = resolved.clone();
         let is_elf = parse_elf_metadata(&host_path).is_ok();
@@ -481,7 +488,7 @@ impl ClosureBuilder {
             if !source.exists() {
                 continue;
             }
-            if let Some(reason) = classify_high_risk_asset(source) {
+            if let Some(reason) = self.filter_reason(source) {
                 debug!("skipping traced resource {} ({reason})", source.display());
                 continue;
             }
@@ -638,7 +645,7 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
-                if let Some(reason) = classify_high_risk_asset(&canonical) {
+                if let Some(reason) = self.filter_reason(&canonical) {
                     debug!(
                         "skipping dependency {} for {} ({reason})",
                         canonical.display(),
@@ -996,6 +1003,13 @@ impl ClosureBuilder {
 
     fn should_skip(name: &str) -> bool {
         name.starts_with("linux-vdso") || name.starts_with("ld-linux")
+    }
+
+    fn filter_reason(&self, path: &Path) -> Option<&'static str> {
+        match classify_high_risk_asset(path) {
+            Some("gpu-driver") if self.allow_gpu_libs => None,
+            other => other,
+        }
     }
 
     fn is_bash_interpreter(interpreter: &Path) -> bool {
