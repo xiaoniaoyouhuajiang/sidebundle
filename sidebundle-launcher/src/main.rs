@@ -246,6 +246,16 @@ fn build_env_block(
         }
     }
 
+    // Map GOROOT (absolute) into bundle payload to make trimmed Go toolchains work.
+    if let Some(go_root) = env_map.get("GOROOT").cloned() {
+        if go_root.starts_with('/') {
+            let mut mapped = bundle_root.to_path_buf();
+            mapped.push("payload");
+            mapped.push(go_root.trim_start_matches('/'));
+            env_map.insert("GOROOT".into(), mapped.to_string_lossy().into_owned());
+        }
+    }
+
     let mut mapped_path_entries: Vec<String> = Vec::new();
     if run_mode == RunMode::Host {
         if let Some(path) = env_map.get("PATH").cloned() {
@@ -290,8 +300,20 @@ fn build_env_block(
             }
         }
         dedup_strings(&mut entries);
-        let joined = entries.join(":");
-        env_map.insert("LD_LIBRARY_PATH".into(), joined);
+        let joined_new = entries.join(":");
+        if let Some(existing) = env_map.get("LD_LIBRARY_PATH").cloned() {
+            let mut combined = String::new();
+            combined.push_str(&joined_new);
+            if !existing.is_empty() {
+                if !combined.is_empty() {
+                    combined.push(':');
+                }
+                combined.push_str(&existing);
+            }
+            env_map.insert("LD_LIBRARY_PATH".into(), combined);
+        } else {
+            env_map.insert("LD_LIBRARY_PATH".into(), joined_new);
+        }
     }
 
     let mut block = Vec::new();
@@ -324,7 +346,16 @@ fn dedup_strings(values: &mut Vec<String>) {
 
 fn map_bundle_path(bundle_root: &Path, rel: &Path, mode: RunMode) -> PathBuf {
     match mode {
-        RunMode::Host => bundle_root.join(rel),
+        RunMode::Host => {
+            if rel.is_absolute() {
+                // For host mode we still want the traced absolute paths to resolve to the
+                // bundled payload rather than the host filesystem.
+                let stripped = rel.strip_prefix("/").unwrap_or(rel);
+                bundle_root.join(stripped)
+            } else {
+                bundle_root.join(rel)
+            }
+        }
         RunMode::Bwrap | RunMode::Chroot => {
             if rel.is_absolute() {
                 return rel.to_path_buf();

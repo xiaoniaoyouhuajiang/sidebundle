@@ -67,20 +67,22 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         name,
         target,
         out_dir,
-        trace_root,
-        trace_backend,
-        image_trace_backend,
-        image_agent_bin,
-        image_agent_cli,
-        image_agent_keep_output,
-        image_agent_keep_rootfs,
-        allow_gpu_libs,
-        strict_validate,
-        run_mode,
-    } = args;
+    trace_root,
+    trace_backend,
+    image_trace_backend,
+    image_agent_bin,
+    image_agent_cli,
+    image_agent_keep_output,
+    image_agent_keep_rootfs,
+    copy_dir,
+    allow_gpu_libs,
+    strict_validate,
+    set_env,
+    run_mode,
+} = args;
 
-    if from_host.is_empty() && from_image.is_empty() {
-        bail!("at least one --from-host or --from-image entry is required");
+    if from_host.is_empty() && from_image.is_empty() && copy_dir.is_empty() {
+        bail!("at least one --from-host, --from-image or --copy-dir entry is required");
     }
 
     let target = TargetTriple::parse(&target)
@@ -186,6 +188,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
 
     ensure_system_assets(&mut closure, &resolver_entries)
         .context("failed to backfill system assets")?;
+    add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
+        .context("failed to apply --copy-dir entries")?;
+    apply_env_overrides(&mut closure, &set_env);
 
     if closure.entry_plans.is_empty() {
         bail!("no executable entries were collected from host or image inputs");
@@ -374,9 +379,22 @@ struct CreateArgs {
     #[arg(long = "trace-root", value_name = "DIR")]
     trace_root: Option<PathBuf>,
 
+    /// Recursively copy a host directory into the bundle payload (format: SRC[:DEST])
+    #[arg(long = "copy-dir", value_name = "SRC[:DEST]", value_parser = parse_copy_dir, num_args = 0..)]
+    copy_dir: Vec<CopyDirArg>,
+
     /// Allow GPU/DRM libraries (e.g., libdrm, libnvidia) to be included in the bundle
     #[arg(long = "allow-gpu-libs")]
     allow_gpu_libs: bool,
+
+    /// Override env vars in generated launchers (KEY=VALUE, repeatable)
+    #[arg(
+        long = "set-env",
+        value_name = "KEY=VALUE",
+        value_parser = parse_kv,
+        num_args = 0..
+    )]
+    set_env: Vec<(String, String)>,
 
     /// Runtime execution mode for launchers
     #[arg(long = "run-mode", value_enum, default_value_t = RunModeArg::Host)]
@@ -519,6 +537,20 @@ pub(crate) struct ImageEntryArg {
     trace_args: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+enum CopyDirArg {
+    Host {
+        source: PathBuf,
+        dest: PathBuf,
+    },
+    Image {
+        backend: Option<BackendPreference>,
+        reference: String,
+        path: PathBuf,
+        dest: PathBuf,
+    },
+}
+
 fn parse_host_entry(value: &str) -> Result<HostEntryArg, String> {
     let (path_part, trace_part) = split_trace_clause(value);
     let trimmed = path_part.trim();
@@ -567,6 +599,59 @@ fn parse_image_entry(value: &str) -> Result<ImageEntryArg, String> {
     })
 }
 
+fn parse_copy_dir(value: &str) -> Result<CopyDirArg, String> {
+    // Image form: [backend://]IMAGE::/abs/path[:DEST]
+    if let Some((image_part, rest)) = value.split_once("::") {
+        let path_dest = rest;
+        let (path_part, dest_part) = match path_dest.split_once(':') {
+            Some((p, d)) if !d.is_empty() => (p, Some(d)),
+            _ => (path_dest, None),
+        };
+        let path_part = path_part.trim();
+        if path_part.is_empty() {
+            return Err("copy-dir image path cannot be empty".into());
+        }
+        let path = PathBuf::from(path_part);
+        if !path.is_absolute() {
+            return Err("copy-dir image path must be absolute".into());
+        }
+        let (backend, reference) = if let Some(rest) = image_part.strip_prefix("docker://") {
+            (Some(BackendPreference::Docker), rest.to_string())
+        } else if let Some(rest) = image_part.strip_prefix("podman://") {
+            (Some(BackendPreference::Podman), rest.to_string())
+        } else {
+            (None, image_part.to_string())
+        };
+        if reference.trim().is_empty() {
+            return Err("copy-dir image reference cannot be empty".into());
+        }
+        let dest = dest_part
+            .map(|d| PathBuf::from(d.trim()))
+            .unwrap_or_else(|| path.clone());
+        return Ok(CopyDirArg::Image {
+            backend,
+            reference: reference.trim().to_string(),
+            path,
+            dest,
+        });
+    }
+
+    // Host form: SRC[:DEST]
+    let (src, dest) = match value.split_once(':') {
+        Some((s, d)) if !d.is_empty() => (s, Some(d)),
+        _ => (value, None),
+    };
+    let src = src.trim();
+    if src.is_empty() {
+        return Err("copy-dir source cannot be empty".into());
+    }
+    let source = PathBuf::from(src);
+    let dest = dest
+        .map(|d| PathBuf::from(d.trim()))
+        .unwrap_or_else(|| PathBuf::from(src.trim()));
+    Ok(CopyDirArg::Host { source, dest })
+}
+
 fn split_trace_clause(value: &str) -> (&str, Option<&str>) {
     if let Some(idx) = value.find("::trace=") {
         let (entry, rest) = value.split_at(idx);
@@ -583,6 +668,16 @@ fn parse_trace_args(spec: &str) -> Result<Vec<String>, String> {
         return Err("trace command cannot be empty".into());
     }
     shell_words::split(trimmed).map_err(|err| format!("failed to parse trace command: {err}"))
+}
+
+fn parse_kv(value: &str) -> Result<(String, String), String> {
+    let (k, v) = value
+        .split_once('=')
+        .ok_or_else(|| "expected KEY=VALUE".to_string())?;
+    if k.trim().is_empty() {
+        return Err("env key cannot be empty".into());
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 fn group_image_entries(
@@ -642,6 +737,117 @@ fn ensure_system_assets(
             });
             mark_existing(&mut existing, &destination);
         }
+    }
+    Ok(())
+}
+
+fn add_copy_dirs(
+    closure: &mut DependencyClosure,
+    dirs: &[CopyDirArg],
+    resolvers: &[(Origin, Arc<dyn PathResolver>)],
+) -> Result<()> {
+    for entry in dirs {
+        match entry {
+            CopyDirArg::Host { source, dest } => {
+                if !source.is_dir() {
+                    bail!(
+                        "--copy-dir source must be a directory: {}",
+                        source.display()
+                    );
+                }
+                copy_dir_into_closure(closure, source, dest)?;
+            }
+            CopyDirArg::Image {
+                backend,
+                reference,
+                path,
+                dest,
+            } => {
+                // Try to reuse existing resolver/rootfs for this image first.
+                let logical = LogicalPath::new(Origin::Image(reference.clone()), path.clone());
+                let physical = resolvers
+                    .iter()
+                    .find(|(origin, _)| origin == logical.origin())
+                    .map(|(_, res)| res.to_host(&logical));
+
+                let physical = if let Some(p) = physical {
+                    p
+                } else {
+                    let provider_pref = backend.unwrap_or(BackendPreference::Auto);
+                    let provider: Box<dyn ImageRootProvider> = match provider_pref {
+                        BackendPreference::Docker | BackendPreference::Auto => {
+                            Box::new(DockerProvider::new())
+                        }
+                        BackendPreference::Podman => Box::new(PodmanProvider::new()),
+                    };
+                    let image_root = provider.prepare_root(reference).with_context(|| {
+                        format!("failed to prepare image root for {}", reference)
+                    })?;
+                    let (_r, rootfs_path, _config) = image_root.into_parts();
+                    physical_image_path(&rootfs_path, path)
+                };
+                if !physical.is_dir() {
+                    bail!(
+                        "--copy-dir image path must be a directory: {} (in {})",
+                        path.display(),
+                        reference
+                    );
+                }
+                copy_dir_into_closure(closure, &physical, dest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_into_closure(
+    closure: &mut DependencyClosure,
+    source: &Path,
+    dest_root: &Path,
+) -> Result<()> {
+    use walkdir::WalkDir;
+
+    for dirent in WalkDir::new(source).follow_links(false).into_iter() {
+        let dirent = dirent.with_context(|| format!("failed to walk {}", source.display()))?;
+        let meta = dirent
+            .metadata()
+            .with_context(|| format!("failed to stat {}", dirent.path().display()))?;
+        if meta.is_dir() {
+            continue;
+        }
+        if meta.file_type().is_symlink() {
+            debug!(
+                "copy-dir: skipping symlink {} (not yet supported)",
+                dirent.path().display()
+            );
+            continue;
+        }
+        let rel = dirent
+            .path()
+            .strip_prefix(source)
+            .with_context(|| {
+                format!(
+                    "failed to strip {} prefix from {}",
+                    source.display(),
+                    dirent.path().display()
+                )
+            })?;
+        let mut dest = PathBuf::from("payload");
+        if dest_root.is_absolute() {
+            for comp in dest_root.components().skip(1) {
+                dest.push(comp.as_os_str());
+            }
+        } else {
+            dest.push(dest_root);
+        }
+        dest.push(rel);
+        if closure.files.iter().any(|f| f.destination == dest) {
+            continue;
+        }
+        let digest = compute_digest(dirent.path())?;
+        closure
+            .files
+            .push(ResolvedFile::new(dirent.path(), dest, digest));
     }
     Ok(())
 }
@@ -1276,6 +1482,24 @@ fn log_validation_report(report: &ValidationReport) {
                 );
             }
         }
+    }
+}
+
+fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, String)]) {
+    if overrides.is_empty() {
+        return;
+    }
+    let overrides: BTreeMap<String, String> = overrides.iter().cloned().collect();
+    for snapshot in closure.metadata.values_mut() {
+        snapshot.env.extend(overrides.clone());
+    }
+    for origin in closure.entry_plans.iter().map(|p| p.origin().clone()) {
+        closure
+            .metadata
+            .entry(origin.clone())
+            .or_insert_with(RuntimeMetadata::default)
+            .env
+            .extend(overrides.clone());
     }
 }
 
