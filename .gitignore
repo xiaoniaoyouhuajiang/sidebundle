@@ -5,6 +5,10 @@
 # Editor/IDE noise
 .idea/
 .vscode/
+.claude/
+openspec/
+AGENTS.md
+CLAUDE.md
 *.swp
 
 # Tooling caches

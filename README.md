@@ -35,7 +35,7 @@ https://github.com/user-attachments/assets/0d4f2ec8-2864-4a33-ab3f-e51773a10af2
 - Record every shipped artifact in `manifest.lock` for auditing and reproducible builds.
 
 ## Requirements
-- Linux host (target support currently limited to `linux-x86_64`). Runtime tracing uses ptrace and
+- Linux host (target binaries support `linux-x86_64` and `linux-aarch64` with musl). Runtime tracing uses ptrace and
   fanotify, so the process needs `CAP_SYS_PTRACE` (root or equivalent) to trace binaries that it does
   not own.
 - Docker or Podman to materialize OCI images. The chosen engine must allow `--cap-add SYS_PTRACE`
@@ -51,6 +51,58 @@ cargo build --release
 cargo install --path sidebundle-cli
 ```
 
+## Cross-compilation for multiple architectures
+sidebundle supports building statically linked binaries for both x86_64 and ARM64 (aarch64) architectures using musl libc for maximum portability.
+
+### CI builds (GitHub Actions)
+The project's CI automatically builds release binaries for both architectures when tags are created. Binary naming convention:
+- `sidebundle-x86_64-musl` for x86_64 Linux with musl
+- `sidebundle-aarch64-musl` for ARM64 Linux with musl
+
+### Local cross-compilation setup
+To build for ARM64 locally, you need to install zig (which includes cross-compilation toolchains):
+
+```bash
+# Install zig (version 0.11.0 or compatible)
+# Download from https://ziglang.org/download/ or use package manager
+
+# Example: download and extract zig 0.11.0
+wget https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz
+tar -xf zig-linux-x86_64-0.11.0.tar.xz
+export PATH="$PWD/zig-linux-x86_64-0.11.0:$PATH"
+
+# Verify zig is available
+zig version
+
+# Build for ARM64
+cargo build --release --target aarch64-unknown-linux-musl
+
+# Build for x86_64 (optional, using zig for consistency)
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+The project includes `.cargo/config.toml` that configures zig as the linker for musl targets.
+
+### Using alternative cross-compilation toolchains
+If you prefer traditional cross-compilation toolchains instead of zig:
+
+```bash
+# On Ubuntu/Debian
+sudo apt-get install gcc-aarch64-linux-gnu
+
+# Then build with custom linker (not required if using zig)
+RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc" \
+  cargo build --release --target aarch64-unknown-linux-musl
+```
+
+### Development workflow
+1. **Local development**: Use `cargo build --release` for native builds
+2. **Cross-compilation testing**: Use `cargo build --release --target aarch64-unknown-linux-musl` with zig installed
+3. **CI testing**:
+   - Should create pull requests (PRs) from feature branches; CI runs on PRs to ensure changes pass lint and test checks
+   - All changes should be reviewed before merging to maintain code quality
+4. **Release process**: Create a git tag (e.g., `v0.2.0`) to trigger automated builds and GitHub release creation
+
 The CLI exposes contextual help:
 
 ```bash
@@ -59,14 +111,14 @@ sidebundle create --help
 ```
 
 ## Quick start (static binary)
-Grab the prebuilt musl-linked binary from GitHub Releases (e.g. `sidebundle-musl-x86_64`). It runs on
+Grab the prebuilt musl-linked binary from GitHub Releases (e.g. `sidebundle-x86_64-musl` or `sidebundle-aarch64-musl`). It runs on
 any modern Linux without extra dependencies.
 
 ### Scenario A: Ship a Python script to machines without Python
 Assume your script has a proper shebang (e.g. `#!/usr/bin/env python3`):
 
 ```bash
-./sidebundle-musl-x86_64 create \
+./sidebundle-x86_64-musl create \
   --name hello-py \
   --from-host "./examples/hello.py" \
   --out-dir bundles \
@@ -79,7 +131,7 @@ Assume your script has a proper shebang (e.g. `#!/usr/bin/env python3`):
 ### Scenario B: Extract `jq` from an Alpine image to run on Ubuntu
 
 ```bash
-./sidebundle-musl-x86_64 create \
+./sidebundle-x86_64-musl create \
   --name jq-alpine \
   --from-image "docker://alpine:3.20::/usr/bin/jq::trace=--version" \
   --out-dir bundles \
@@ -175,7 +227,7 @@ Runtime tracing is optional but recommended for dynamic binaries. Choose a backe
 
 ### Other useful flags
 - `--name` controls the bundle directory name (default `bundle`).
-- `--target` sets the target triple (currently only `linux-x86_64`).
+- `--target` sets the target triple (`linux-x86_64` or `linux-aarch64`).
 - `--out-dir` places bundles under a custom root instead of `target/bundles`.
 - `--trace-root DIR` treats host paths as if they were relative to `DIR`, allowing you to feed files
   extracted from chroots or rootfs archives.
@@ -189,6 +241,9 @@ Runtime tracing is optional but recommended for dynamic binaries. Choose a backe
 - `--allow-gpu-libs` allows GPU/DRM-related libraries (e.g., libdrm, libnvidia) to be included
   instead of being filtered out.
 - `--strict-validate` turns linker validation failures into build failures.
+- `--copy-dir SRC[:DEST]` recursively copies a host directory into the bundle payload. If DEST is omitted, files are placed under `payload/` preserving the source directory structure.
+- `--set-env KEY=VALUE` overrides environment variables in generated launchers (repeatable).
+- `--run-mode MODE` sets the runtime execution mode for launchers (`Host`, `Bwrap`, or `Chroot`). Default is `Host`.
 - `--log-level` adjusts logging (`error`, `warn`, `info`, `debug`, `trace`).
 
 ## Mixed host + image example
