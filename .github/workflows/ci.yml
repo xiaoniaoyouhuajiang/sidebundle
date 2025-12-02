@@ -85,6 +85,21 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       # Build the binary
+      - name: Configure cross linker (zig)
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=zig cc -target x86_64-linux-musl" >> $GITHUB_ENV
+              echo "CC_x86_64_unknown_linux_musl=zig cc -target x86_64-linux-musl" >> $GITHUB_ENV
+              echo "AR_x86_64_unknown_linux_musl=zig ar" >> $GITHUB_ENV
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=zig cc -target aarch64-linux-musl" >> $GITHUB_ENV
+              echo "CC_aarch64_unknown_linux_musl=zig cc -target aarch64-linux-musl" >> $GITHUB_ENV
+              echo "AR_aarch64_unknown_linux_musl=zig ar" >> $GITHUB_ENV
+              ;;
+          esac
+
       - run: cargo build --release --target ${{ matrix.target }}
 
       # Rename binary to include architecture identifier
