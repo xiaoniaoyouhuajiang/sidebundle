@@ -2,7 +2,9 @@ use super::{TraceBackend, TraceError, TraceInvocation, TraceReport};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
-use nix::sys::ptrace::{self, AddressType};
+use nix::sys::ptrace;
+#[cfg(target_arch = "x86_64")]
+use nix::sys::ptrace::AddressType;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, chroot, execve, fork, ForkResult, Pid};
