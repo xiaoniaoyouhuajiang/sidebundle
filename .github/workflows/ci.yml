@@ -2,10 +2,18 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'README.zh.md'
   push:
     branches: [main]
     tags:
       - "v*"
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'README.zh.md'
   workflow_dispatch:
 
 env:

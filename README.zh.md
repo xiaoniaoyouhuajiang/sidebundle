@@ -277,6 +277,7 @@ sidebundle agent trace \
   - 宿主：`--trace-backend` 支持 `off|auto|ptrace|fanotify|combined`。
   - 镜像：`--image-trace-backend` 支持上述选项，另外有 `agent|agent-combined` 在容器内运行跟踪。Agent 模式需 Docker/Podman 提供 `SYS_PTRACE`/`SYS_ADMIN` 和 `seccomp=unconfined`。
   JVM 这类通过 `dlopen` 加载库的场景，推荐 `combined`/`agent-combined` 捕获完整依赖。
+- **权限矩阵**：见 `docs/permissions.md`，列出不同跟踪后端与运行模式的权限/能力要求。
 
 ## sidebundle 如何收集依赖
 

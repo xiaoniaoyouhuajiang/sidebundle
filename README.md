@@ -314,6 +314,7 @@ Ship the entire bundle directory to another host and execute `bin/<entry>`.
     inside the container. Agent modes require Docker/Podman with `SYS_PTRACE`/`SYS_ADMIN` and
     `seccomp=unconfined`.
   Choose `combined`/`agent-combined` to capture `dlopen`-loaded libs (e.g., JVM `libjava.so`).
+- **Permissions matrix**: see `docs/permissions_en.md` for required capabilities and runtime modes.
 
 ## How sidebundle collects dependencies
 
