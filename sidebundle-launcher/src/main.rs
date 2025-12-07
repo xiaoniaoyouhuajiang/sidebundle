@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -83,6 +85,7 @@ fn run() -> Result<()> {
                     let linker_inside = linker_mapped
                         .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
                     exec_chroot(
+                        bundle_root,
                         &payload_root,
                         dynamic,
                         &linker_inside,
@@ -145,6 +148,7 @@ fn run() -> Result<()> {
                     let linker_inside = linker_mapped
                         .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
                     exec_chroot(
+                        bundle_root,
                         &payload_root,
                         dynamic,
                         &linker_inside,
@@ -381,6 +385,101 @@ fn map_bundle_path(bundle_root: &Path, rel: &Path, mode: RunMode) -> PathBuf {
     }
 }
 
+fn ensure_payload_data(bundle_root: &Path, payload_root: &Path) -> Result<()> {
+    if let Err(err) = isolate_mount_namespace() {
+        eprintln!("sidebundle launcher: warning: failed to isolate mount namespace ({err})");
+    }
+
+    let source = bundle_root.join("data");
+    if !source.exists() {
+        return Ok(());
+    }
+    let dest = payload_root.join("data");
+    if dest.exists() {
+        // If it already has contents, assume a previous run populated it.
+        if dest.read_dir().map(|mut it| it.next().is_some()).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+
+    fs::create_dir_all(&dest)
+        .with_context(|| format!("failed to prepare chroot data dir {}", dest.display()))?;
+
+    // Prefer a bind mount to avoid duplicating data; fall back to hardlink/copy if not permitted.
+    let source_c = os_to_cstring(source.as_os_str())?;
+    let dest_c = os_to_cstring(dest.as_os_str())?;
+    unsafe {
+        if libc::mount(
+            source_c.as_ptr(),
+            dest_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        ) == 0
+        {
+            return Ok(());
+        }
+    }
+    let mount_err = std::io::Error::last_os_error();
+    mirror_data_tree(&source, &dest).with_context(|| {
+        format!(
+            "failed to mirror data into chroot (bind mount failed: {mount_err})"
+        )
+    })
+}
+
+fn mirror_data_tree(source: &Path, dest: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dest.join(entry.file_name());
+        let ftype = entry.file_type()?;
+        if ftype.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            mirror_data_tree(&src_path, &dst_path)?;
+        } else if ftype.is_symlink() {
+            let target = fs::read_link(&src_path)?;
+            if dst_path.exists() {
+                let _ = fs::remove_file(&dst_path);
+            }
+            symlink(target, &dst_path)?;
+        } else {
+            // Try hardlink first to save space; fall back to copy.
+            match fs::hard_link(&src_path, &dst_path) {
+                Ok(_) => {}
+                Err(_) => {
+                    fs::copy(&src_path, &dst_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort: isolate into a fresh mount namespace and make mounts private so bind mounts
+/// (payload/data) don't leak back to the host namespace.
+fn isolate_mount_namespace() -> Result<()> {
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| "failed to unshare mount namespace");
+        }
+        let root = CString::new("/")?;
+        if libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(io::Error::last_os_error())
+                .with_context(|| "failed to set mount propagation to private");
+        }
+    }
+    Ok(())
+}
+
 fn map_env_path(value: &str, mode: RunMode) -> PathBuf {
     let p = Path::new(value);
     if !p.is_absolute() {
@@ -549,6 +648,7 @@ fn exec_bwrap(
 }
 
 fn exec_chroot(
+    bundle_root: &Path,
     payload_root: &Path,
     dynamic: bool,
     linker: &Path,
@@ -556,6 +656,7 @@ fn exec_chroot(
     argv: &[CString],
     envp: &[CString],
 ) -> Result<()> {
+    ensure_payload_data(bundle_root, payload_root)?;
     unsafe {
         let root_c = os_to_cstring(payload_root.as_os_str())?;
         if libc::chroot(root_c.as_ptr()) != 0 {

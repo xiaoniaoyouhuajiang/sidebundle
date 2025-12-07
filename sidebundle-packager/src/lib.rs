@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use log::{debug, info, warn};
+#[cfg(target_os = "linux")]
+use nix::libc;
 use pathdiff::diff_paths;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -57,6 +61,10 @@ impl Packager {
 
         let bundle_root = self.output_root.join(spec.name());
         if bundle_root.exists() {
+            #[cfg(target_os = "linux")]
+            {
+                cleanup_mounts(&bundle_root);
+            }
             fs::remove_dir_all(&bundle_root).map_err(|source| PackagerError::Io {
                 path: bundle_root.clone(),
                 source,
@@ -264,7 +272,7 @@ impl Packager {
             });
         }
 
-        ensure_device_nodes(&bundle_root)?;
+        ensure_runtime_shims(&bundle_root)?;
 
         write_manifest(
             &bundle_root,
@@ -377,6 +385,24 @@ fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), P
     })?;
     copy_permissions(stored, dest).ok();
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_mounts(bundle_root: &Path) {
+    for rel in ["payload/data", "payload"] {
+        let target = bundle_root.join(rel);
+        if !target.exists() {
+            continue;
+        }
+        let c_path = match CString::new(target.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        unsafe {
+            // MNT_DETACH so we don't care about active users; ignore errors.
+            let _ = libc::umount2(c_path.as_ptr(), libc::MNT_DETACH);
+        }
+    }
 }
 
 /// Resolve a symlink source to its target to avoid embedding host symlink structure
@@ -658,6 +684,49 @@ fn ensure_device_nodes(bundle_root: &Path) -> Result<(), PackagerError> {
                     source,
                 })?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Bundle-time shims for runtime expectations (device nodes, interpreter aliases, etc.).
+fn ensure_runtime_shims(bundle_root: &Path) -> Result<(), PackagerError> {
+    ensure_device_nodes(bundle_root)?;
+    // Data-driven alias list for common interpreter names.
+    const ALIASES: &[(&str, &str)] = &[
+        // pip shebang commonly points at /usr/bin/python3; ensure it exists if python3.10 is present.
+        ("payload/usr/bin/python3", "payload/usr/bin/python3.10"),
+    ];
+    ensure_aliases(bundle_root, ALIASES)
+}
+
+fn ensure_aliases(bundle_root: &Path, aliases: &[(&str, &str)]) -> Result<(), PackagerError> {
+    for (dst_rel, target_rel) in aliases {
+        let dst = bundle_root.join(dst_rel);
+        if dst.exists() {
+            continue;
+        }
+        let target = bundle_root.join(target_rel);
+        if !target.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let relative = dst
+                .parent()
+                .and_then(|p| diff_paths(&target, p))
+                .unwrap_or_else(|| target.clone());
+            symlink(&relative, &dst).map_err(|source| PackagerError::Io {
+                path: dst.clone(),
+                source,
+            })?;
         }
     }
     Ok(())
