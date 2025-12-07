@@ -397,7 +397,11 @@ fn ensure_payload_data(bundle_root: &Path, payload_root: &Path) -> Result<()> {
     let dest = payload_root.join("data");
     if dest.exists() {
         // If it already has contents, assume a previous run populated it.
-        if dest.read_dir().map(|mut it| it.next().is_some()).unwrap_or(false) {
+        if dest
+            .read_dir()
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
     }
@@ -422,9 +426,7 @@ fn ensure_payload_data(bundle_root: &Path, payload_root: &Path) -> Result<()> {
     }
     let mount_err = std::io::Error::last_os_error();
     mirror_data_tree(&source, &dest).with_context(|| {
-        format!(
-            "failed to mirror data into chroot (bind mount failed: {mount_err})"
-        )
+        format!("failed to mirror data into chroot (bind mount failed: {mount_err})")
     })
 }
 
