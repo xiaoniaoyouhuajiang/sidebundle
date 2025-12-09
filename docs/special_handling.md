@@ -44,3 +44,7 @@
 - 多调用二进制在 Host 模式报 “Requested utility …”：改用 bwrap/chroot 或非多调用版本。
 - Java/Go 运行时绝对路径丢失：确认 `JAVA_HOME`/`GOROOT` 映射逻辑（见上）。
 - 网络解析失败：检查 `payload/etc/resolv.conf` 是否为空，或宿主是否提供兜底。
+
+## TODO：语言运行时资源自动收集
+- 背景：Python/Node/Java 等语言层资源（stdlib、JS 内置、JRE modules/security 等）目前需用户通过 `::trace` 或 `--copy-dir` 明确引入；未采集会在运行时缺 `encodings`、内置 JS 等。
+- 方向：提供可选的语言感知运行时探测（非交互、可配置），自动读取 `sys.path`/Node 内置列表/JRE modules 等并收集对应资源，降低打包踩坑概率，同时允许禁用以保证安全可控。
