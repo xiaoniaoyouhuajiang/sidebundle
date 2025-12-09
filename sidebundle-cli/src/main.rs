@@ -78,6 +78,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         strict_validate,
         set_env,
         run_mode,
+        emit_shim,
     } = args;
 
     if from_host.is_empty() && from_image.is_empty() && copy_dir.is_empty() {
@@ -196,9 +197,11 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     }
 
     let packager = if let Some(dir) = out_dir {
-        Packager::new().with_output_root(dir)
-    } else {
         Packager::new()
+            .with_output_root(dir)
+            .with_shim_output(emit_shim)
+    } else {
+        Packager::new().with_shim_output(emit_shim)
     };
     let output = packager
         .emit(&spec, &closure)
@@ -385,6 +388,10 @@ struct CreateArgs {
     /// Allow GPU/DRM libraries (e.g., libdrm, libnvidia) to be included in the bundle
     #[arg(long = "allow-gpu-libs")]
     allow_gpu_libs: bool,
+
+    /// Emit self-extracting shim executables alongside the bundle
+    #[arg(long = "emit-shim")]
+    emit_shim: bool,
 
     /// Override env vars in generated launchers (KEY=VALUE, repeatable)
     #[arg(

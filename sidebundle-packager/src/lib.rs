@@ -16,13 +16,16 @@ use sidebundle_core::{BundleSpec, DependencyClosure, ResolvedSymlink, TracedFile
 use thiserror::Error;
 
 mod launcher;
+mod shim;
 use launcher::write_launchers;
+use shim::write_shims;
 
 /// Writes the dependency closure to disk and generates launchers.
 #[derive(Debug, Clone)]
 pub struct Packager {
     output_root: PathBuf,
     copy_system_assets: bool,
+    emit_shim: bool,
 }
 
 impl Default for Packager {
@@ -30,6 +33,7 @@ impl Default for Packager {
         Self {
             output_root: PathBuf::from("target/bundles"),
             copy_system_assets: true,
+            emit_shim: false,
         }
     }
 }
@@ -47,6 +51,12 @@ impl Packager {
     /// Enable or disable copying of system config assets (/etc/passwd, etc.).
     pub fn with_system_assets(mut self, enabled: bool) -> Self {
         self.copy_system_assets = enabled;
+        self
+    }
+
+    /// Emit self-extracting shim executables alongside the bundle.
+    pub fn with_shim_output(mut self, enabled: bool) -> Self {
+        self.emit_shim = enabled;
         self
     }
 
@@ -284,6 +294,15 @@ impl Packager {
             },
         )?;
 
+        if self.emit_shim {
+            let entries: Vec<String> = closure
+                .entry_plans
+                .iter()
+                .map(|plan| plan.display_name().to_string())
+                .collect();
+            write_shims(&bundle_root, spec.name(), &entries)?;
+        }
+
         info!(
             "bundle `{}` written to {}",
             spec.name(),
@@ -304,6 +323,8 @@ pub enum PackagerError {
     },
     #[error("failed to serialize manifest: {0}")]
     Manifest(serde_json::Error),
+    #[error("shim generation failed: {0}")]
+    Shim(String),
 }
 
 #[derive(Serialize)]
@@ -365,6 +386,12 @@ fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), P
             path: dest.to_path_buf(),
             source,
         })?;
+    }
+    // Prefer a hardlink so binaries that inspect /proc/self/exe (e.g., busybox) see the expected
+    // payload path instead of the hashed data path.
+    if fs::hard_link(stored, dest).is_ok() {
+        copy_permissions(stored, dest).ok();
+        return Ok(());
     }
     if allow_symlink {
         #[cfg(unix)]
@@ -767,6 +794,9 @@ fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), Packager
 mod tests {
     use super::*;
     use sidebundle_core::{BundleSpec, DependencyClosure, TargetTriple};
+    use sidebundle_shim::{ShimTrailer, TRAILER_SIZE};
+    use std::io::{Read, Seek, SeekFrom};
+    use tempfile::tempdir;
 
     #[test]
     fn empty_closure_rejected() {
@@ -775,5 +805,29 @@ mod tests {
         let closure = DependencyClosure::default();
         let packager = Packager::new();
         assert!(packager.emit(&spec, &closure).is_err());
+    }
+
+    #[test]
+    fn write_shim_outputs_trailer() {
+        let temp = tempdir().unwrap();
+        let bundle_root = temp.path().join("bundle");
+        fs::create_dir_all(bundle_root.join("bin")).unwrap();
+        fs::create_dir_all(bundle_root.join("payload")).unwrap();
+        fs::write(bundle_root.join("payload").join("file.txt"), b"hello").unwrap();
+        let shim_path = {
+            let entries = vec!["hello".to_string()];
+            shim::write_shims(&bundle_root, "demo", &entries).unwrap();
+            bundle_root.join("shims/hello")
+        };
+        assert!(shim_path.exists());
+        let mut file = File::open(&shim_path).unwrap();
+        let size = file.metadata().unwrap().len();
+        assert!(size > TRAILER_SIZE as u64);
+        file.seek(SeekFrom::End(-(TRAILER_SIZE as i64))).unwrap();
+        let mut buf = [0u8; TRAILER_SIZE];
+        file.read_exact(&mut buf).unwrap();
+        let trailer = ShimTrailer::from_bytes(&buf).expect("valid trailer");
+        assert!(trailer.archive_len > 0);
+        assert!(trailer.metadata_len > 0);
     }
 }

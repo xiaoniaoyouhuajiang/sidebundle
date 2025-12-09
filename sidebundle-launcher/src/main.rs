@@ -48,7 +48,7 @@ fn run() -> Result<()> {
             let payload_root = bundle_root.join("payload");
             let entry_host = bundle_root.join(&binary);
             let entry_mapped = map_bundle_path(bundle_root, &binary, run_mode);
-            let linker_mapped = linker
+            let _linker_mapped = linker
                 .as_ref()
                 .map(|rel| map_bundle_path(bundle_root, rel, run_mode));
             let argv = build_binary_argv(&entry_mapped)?;
@@ -68,31 +68,11 @@ fn run() -> Result<()> {
                     unreachable!();
                 }
                 RunMode::Bwrap => {
-                    let linker_inside = linker_mapped
-                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-                    exec_bwrap(
-                        bundle_root,
-                        &payload_root,
-                        dynamic,
-                        &linker_inside,
-                        &entry_mapped,
-                        &argv,
-                        &env_block,
-                    )?;
+                    exec_bwrap(bundle_root, &payload_root, &entry_mapped, &argv, &env_block)?;
                     unreachable!();
                 }
                 RunMode::Chroot => {
-                    let linker_inside = linker_mapped
-                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-                    exec_chroot(
-                        bundle_root,
-                        &payload_root,
-                        dynamic,
-                        &linker_inside,
-                        &entry_mapped,
-                        &argv,
-                        &env_block,
-                    )?;
+                    exec_chroot(bundle_root, &payload_root, &entry_mapped, &argv, &env_block)?;
                     unreachable!();
                 }
             }
@@ -111,7 +91,7 @@ fn run() -> Result<()> {
             let interpreter_host = bundle_root.join(&interpreter);
             let interpreter_mapped = map_bundle_path(bundle_root, &interpreter, run_mode);
             let script_mapped = map_bundle_path(bundle_root, &script, run_mode);
-            let linker_mapped = linker
+            let _linker_mapped = linker
                 .as_ref()
                 .map(|rel| map_bundle_path(bundle_root, rel, run_mode));
             let argv = build_script_argv(&interpreter_mapped, &script_mapped, &args)?;
@@ -131,13 +111,9 @@ fn run() -> Result<()> {
                     unreachable!();
                 }
                 RunMode::Bwrap => {
-                    let linker_inside = linker_mapped
-                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
                     exec_bwrap(
                         bundle_root,
                         &payload_root,
-                        dynamic,
-                        &linker_inside,
                         &interpreter_mapped,
                         &argv,
                         &env_block,
@@ -145,13 +121,9 @@ fn run() -> Result<()> {
                     unreachable!();
                 }
                 RunMode::Chroot => {
-                    let linker_inside = linker_mapped
-                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
                     exec_chroot(
                         bundle_root,
                         &payload_root,
-                        dynamic,
-                        &linker_inside,
                         &interpreter_mapped,
                         &argv,
                         &env_block,
@@ -546,7 +518,8 @@ fn exec_dynamic(linker: &Path, entry: &Path, argv: &[CString], envp: &[CString])
     let entry_cstr = os_to_cstring(entry.as_os_str())?;
 
     let mut argv_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 2);
-    argv_ptrs.push(linker_cstr.as_ptr());
+    // Keep argv[0] as the entry to satisfy multi-call binaries that validate argv0.
+    argv_ptrs.push(entry_cstr.as_ptr());
     argv_ptrs.push(entry_cstr.as_ptr());
     for arg in argv.iter().skip(1) {
         argv_ptrs.push(arg.as_ptr());
@@ -571,8 +544,6 @@ fn exec_dynamic(linker: &Path, entry: &Path, argv: &[CString], envp: &[CString])
 fn exec_bwrap(
     bundle_root: &Path,
     payload_root: &Path,
-    dynamic: bool,
-    linker: &Path,
     entry: &Path,
     argv: &[CString],
     envp: &[CString],
@@ -625,17 +596,10 @@ fn exec_bwrap(
     args.push(CString::new("--unshare-all")?);
     args.push(CString::new("--")?);
 
-    if dynamic {
-        args.push(os_to_cstring(linker.as_os_str())?);
-        args.push(os_to_cstring(entry.as_os_str())?);
-        for arg in argv.iter().skip(1) {
-            args.push(arg.clone());
-        }
-    } else {
-        args.push(os_to_cstring(entry.as_os_str())?);
-        for arg in argv.iter().skip(1) {
-            args.push(arg.clone());
-        }
+    // For bwrap/chroot we rely on the kernel to use the bundled PT_INTERP inside the sandbox.
+    args.push(os_to_cstring(entry.as_os_str())?);
+    for arg in argv.iter().skip(1) {
+        args.push(arg.clone());
     }
 
     let mut argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
@@ -652,8 +616,6 @@ fn exec_bwrap(
 fn exec_chroot(
     bundle_root: &Path,
     payload_root: &Path,
-    dynamic: bool,
-    linker: &Path,
     entry: &Path,
     argv: &[CString],
     envp: &[CString],
@@ -670,9 +632,7 @@ fn exec_chroot(
                 .with_context(|| "chdir after chroot failed");
         }
     }
-    if dynamic {
-        exec_dynamic(linker, entry, argv, envp)
-    } else {
-        exec_static(entry, argv, envp)
-    }
+    // Once chrooted, the PT_INTERP inside the payload points to bundled ld-linux; exec the entry
+    // directly so /proc/self/exe matches the intended binary (important for multi-call binaries).
+    exec_static(entry, argv, envp)
 }

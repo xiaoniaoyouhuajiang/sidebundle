@@ -20,6 +20,8 @@ fn main() {
     let launcher_manifest = workspace_root
         .join("sidebundle-launcher")
         .join("Cargo.toml");
+    let shim_target_dir = target_dir.join("sidebundle-shim-build");
+    let shim_manifest = workspace_root.join("sidebundle-shim").join("Cargo.toml");
 
     let mut command = Command::new(&cargo);
     command
@@ -45,6 +47,30 @@ fn main() {
         panic!("failed to compile sidebundle-launcher");
     }
 
+    let mut shim_build = Command::new(&cargo);
+    shim_build
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&shim_manifest)
+        .arg("--target")
+        .arg(&target)
+        .arg("--target-dir")
+        .arg(&shim_target_dir);
+    if profile == "release" {
+        shim_build.arg("--release");
+    } else if profile != "debug" {
+        shim_build.arg("--profile").arg(&profile);
+    }
+    if env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true") {
+        shim_build.arg("--offline");
+    }
+    let shim_status = shim_build
+        .status()
+        .expect("failed to invoke cargo for shim build");
+    if !shim_status.success() {
+        panic!("failed to compile sidebundle-shim");
+    }
+
     let profile_dir = if profile == "release" {
         "release"
     } else {
@@ -55,13 +81,25 @@ fn main() {
         .join(profile_dir)
         .join("sidebundle-launcher");
     copy_launcher(&built_path, &out_dir.join("sidebundle-launcher"));
+    let shim_built_path = shim_target_dir
+        .join(&target)
+        .join(profile_dir)
+        .join("sidebundle-shim");
+    copy_launcher(&shim_built_path, &out_dir.join("sidebundle-shim"));
 
     if let Some(src_dir) = launcher_manifest.parent() {
+        println!("cargo:rerun-if-changed={}", src_dir.display());
+    }
+    if let Some(src_dir) = shim_manifest.parent() {
         println!("cargo:rerun-if-changed={}", src_dir.display());
     }
     println!(
         "cargo:rustc-env=SIDEBUNDLE_LAUNCHER_BIN={}",
         out_dir.join("sidebundle-launcher").display()
+    );
+    println!(
+        "cargo:rustc-env=SIDEBUNDLE_SHIM_BIN={}",
+        out_dir.join("sidebundle-shim").display()
     );
 }
 

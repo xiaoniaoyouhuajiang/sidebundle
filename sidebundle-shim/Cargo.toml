@@ -1,0 +1,22 @@
+[package]
+name = "sidebundle-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "sidebundle_shim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sidebundle-shim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+flate2 = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"

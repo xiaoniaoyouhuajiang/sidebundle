@@ -5,6 +5,7 @@ members = [
     "sidebundle-closure",
     "sidebundle-packager",
     "sidebundle-launcher",
+    "sidebundle-shim",
 ]
 resolver = "2"
 
