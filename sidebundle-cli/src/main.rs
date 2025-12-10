@@ -144,35 +144,13 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .with_resolver_set(host_resolvers.clone())
         .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(backend) = host_backend.clone() {
-        let mut env_pairs: Vec<(OsString, OsString)> = Vec::new();
-        if let Ok(val) = std::env::var("LD_LIBRARY_PATH") {
-            if !val.is_empty() {
-                env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(val)));
-            }
-        }
-        // Heuristic: if JAVA_HOME is set, expose its private lib paths so java trace works under bwrap.
-        if let Ok(java_home) = std::env::var("JAVA_HOME") {
-            let mut parts = Vec::new();
-            parts.push(format!("{java_home}/lib"));
-            parts.push(format!("{java_home}/lib/server"));
-            parts.push(format!("{java_home}/lib/jli"));
-            let mut combined = parts.join(":");
-            if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
-                if !existing.is_empty() {
-                    combined.push(':');
-                    combined.push_str(&existing);
-                }
-            }
-            env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(combined)));
-            env_pairs.push((OsString::from("JAVA_HOME"), OsString::from(java_home)));
-        }
-
-        let tracer = if env_pairs.is_empty() {
+        let tracer_env = derive_trace_env(&spec);
+        let tracer = if tracer_env.is_empty() {
             TraceCollector::new().with_backend(backend)
         } else {
             TraceCollector::new()
                 .with_backend(backend)
-                .with_env(env_pairs)
+                .with_env(tracer_env)
         };
         builder = builder.with_tracer(tracer);
     }
@@ -1596,6 +1574,58 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
             .env
             .extend(overrides.clone());
     }
+}
+
+/// Heuristic env construction for trace runs (host inputs).
+fn derive_trace_env(spec: &BundleSpec) -> Vec<(OsString, OsString)> {
+    let mut env_pairs: Vec<(OsString, OsString)> = Vec::new();
+
+    let existing_ld = std::env::var("LD_LIBRARY_PATH").ok();
+    if let Some(val) = existing_ld.as_ref().filter(|s| !s.is_empty()) {
+        env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(val)));
+    }
+
+    let mut java_home: Option<PathBuf> = std::env::var("JAVA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    if java_home.is_none() {
+        for entry in &spec.entries {
+            if entry.logical.origin() != &Origin::Host {
+                continue;
+            }
+            let path = entry.logical.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == "java" || name == "javac" {
+                    if let Ok(real) = std::fs::canonicalize(path) {
+                        if let Some(home) = real.parent().and_then(|p| p.parent()) {
+                            java_home = Some(home.to_path_buf());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(home) = java_home {
+        let mut parts: Vec<String> = vec![
+            home.join("lib").to_string_lossy().into_owned(),
+            home.join("lib/server").to_string_lossy().into_owned(),
+            home.join("lib/jli").to_string_lossy().into_owned(),
+        ];
+        if let Some(val) = existing_ld {
+            if !val.is_empty() {
+                parts.push(val);
+            }
+        }
+        let joined = parts.join(":");
+        env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(&joined)));
+        env_pairs.push((OsString::from("JAVA_HOME"), OsString::from(home)));
+    }
+
+    env_pairs
 }
 
 fn include_java_runtime(
