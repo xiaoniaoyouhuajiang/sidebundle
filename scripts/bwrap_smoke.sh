@@ -33,6 +33,13 @@ arch_lib_dir_root() {
   esac
 }
 
+multiarch_symlinks() {
+  # Some distros rely on /lib64 or /usr/lib64 symlinks; include them if they exist.
+  for p in /lib64 /usr/lib64; do
+    [[ -e "$p" ]] && echo "$p"
+  done
+}
+
 ensure_cli() {
   if [[ -n "${SB_CLI:-}" ]]; then
     echo "$SB_CLI"
@@ -76,6 +83,7 @@ cli="$(ensure_cli)"
 ensure_bwrap
 arch_lib="$(arch_lib_dir)"
 arch_root_lib="$(arch_lib_dir_root)"
+arch_symlinks=($(multiarch_symlinks))
 
 # Node
 node_bin="${SB_NODE_BIN:-$(command -v node || true)}"
@@ -140,6 +148,9 @@ if [[ -n "$java_bin" ]]; then
   [[ -n "$sec_src" ]] && copy_args+=(--copy-dir "$sec_src:$sec_dest")
   [[ -n "$arch_lib" && -d "$arch_lib" ]] && copy_args+=(--copy-dir "$arch_lib")
   [[ -n "$arch_root_lib" && -d "$arch_root_lib" ]] && copy_args+=(--copy-dir "$arch_root_lib")
+  for link in "${arch_symlinks[@]}"; do
+    copy_args+=(--copy-dir "$link")
+  done
   run_bundle "bundle java" "$cli" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
