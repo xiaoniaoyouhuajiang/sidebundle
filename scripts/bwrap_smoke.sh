@@ -11,11 +11,17 @@ set -euo pipefail
 #   SB_JAVA_BIN, JAVA_HOME
 #   SB_CLI (path to sidebundle-cli)
 #   OUT (output dir)
+# Debug:
+#   SB_DEBUG=1 enables bash tracing and extra diagnostics
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/target/smoke-$ARCH}"
 mkdir -p "$OUT"
+
+if [[ "${SB_DEBUG:-0}" != "0" ]]; then
+  set -x
+fi
 
 arch_lib_dir() {
   case "$ARCH" in
@@ -151,6 +157,7 @@ if [[ -n "$java_bin" ]]; then
   for link in "${arch_symlinks[@]}"; do
     copy_args+=(--copy-dir "$link")
   done
+  echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
   run_bundle "bundle java" "$cli" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
@@ -158,6 +165,10 @@ if [[ -n "$java_bin" ]]; then
     --run-mode bwrap \
     --trace-backend off \
     "${copy_args[@]}"
+  echo "find libstdc++ in bundle (java):"
+  find "$java_out/payload" -maxdepth 4 -name 'libstdc++.so*' -type f -print || true
+  echo "ldd on bundled java (host perspective):"
+  ldd "$java_out/bin/java" || true
   run_bundle "run java version+settings" "$java_out/bin/java" -XshowSettings:properties -version
   if command -v javac >/dev/null 2>&1; then
     tmpdir="$(mktemp -d)"
