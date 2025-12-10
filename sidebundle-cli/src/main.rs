@@ -144,7 +144,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .with_resolver_set(host_resolvers.clone())
         .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(backend) = host_backend.clone() {
-        let tracer_env = derive_trace_env(&spec);
+        let (tracer_env, ld_paths_override) = derive_trace_env(&spec);
         let tracer = if tracer_env.is_empty() {
             TraceCollector::new().with_backend(backend)
         } else {
@@ -152,6 +152,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
                 .with_backend(backend)
                 .with_env(tracer_env)
         };
+        if let Some(paths) = ld_paths_override {
+            builder = builder.with_ld_library_paths(paths);
+        }
         builder = builder.with_tracer(tracer);
     }
 
@@ -1577,8 +1580,9 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
 }
 
 /// Heuristic env construction for trace runs (host inputs).
-fn derive_trace_env(spec: &BundleSpec) -> Vec<(OsString, OsString)> {
+fn derive_trace_env(spec: &BundleSpec) -> (Vec<(OsString, OsString)>, Option<Vec<PathBuf>>) {
     let mut env_pairs: Vec<(OsString, OsString)> = Vec::new();
+    let mut ld_paths_override: Option<Vec<PathBuf>> = None;
 
     let existing_ld = std::env::var("LD_LIBRARY_PATH").ok();
     if let Some(val) = existing_ld.as_ref().filter(|s| !s.is_empty()) {
@@ -1623,9 +1627,10 @@ fn derive_trace_env(spec: &BundleSpec) -> Vec<(OsString, OsString)> {
         let joined = parts.join(":");
         env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(&joined)));
         env_pairs.push((OsString::from("JAVA_HOME"), OsString::from(home)));
+        ld_paths_override = Some(parts.into_iter().map(PathBuf::from).collect());
     }
 
-    env_pairs
+    (env_pairs, ld_paths_override)
 }
 
 fn include_java_runtime(
