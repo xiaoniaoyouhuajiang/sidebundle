@@ -25,7 +25,7 @@ use sidebundle_closure::{
 };
 use sidebundle_core::{
     AuxvEntry, BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin,
-    ResolvedFile, RunMode, RuntimeMetadata, SystemInfo, TargetTriple,
+    ResolvedFile, ResolvedSymlink, RunMode, RuntimeMetadata, SystemInfo, TargetTriple,
 };
 use sidebundle_packager::Packager;
 
