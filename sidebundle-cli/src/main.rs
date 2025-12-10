@@ -851,13 +851,27 @@ fn copy_dir_into_closure(
             let target = fs::read_link(dirent.path()).with_context(|| {
                 format!("failed to read symlink target {}", dirent.path().display())
             })?;
-            let bundle_target = if target.is_absolute() {
+            let mut bundle_target = if target.is_absolute() {
                 payload_path_for(&target)
             } else if let Some(parent) = dest.parent() {
                 parent.join(&target)
             } else {
                 PathBuf::from("payload").join(&target)
             };
+            let normalized_dest = normalize_rel_path(&dest);
+            let normalized_target = normalize_rel_path(&bundle_target);
+            if normalized_dest == normalized_target {
+                // Avoid self-referential symlink loops; fall back to copying the file contents.
+                if closure.files.iter().any(|f| f.destination == dest) {
+                    continue;
+                }
+                let digest = compute_digest(dirent.path())?;
+                closure
+                    .files
+                    .push(ResolvedFile::new(dirent.path(), dest, digest));
+                continue;
+            }
+            bundle_target = normalized_target;
             if !closure
                 .symlinks
                 .iter()
@@ -878,6 +892,36 @@ fn copy_dir_into_closure(
         }
     }
     Ok(())
+}
+
+fn normalize_rel_path(path: &Path) -> PathBuf {
+    let mut stack: Vec<PathBuf> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                stack.pop();
+            }
+            std::path::Component::Normal(part) => stack.push(PathBuf::from(part)),
+            std::path::Component::RootDir => {
+                stack.clear();
+                stack.push(PathBuf::from("/"));
+            }
+            std::path::Component::Prefix(_) => {
+                stack.clear();
+                stack.push(PathBuf::from(comp.as_os_str()));
+            }
+        }
+    }
+    let mut out = PathBuf::new();
+    for part in stack.iter() {
+        out.push(part);
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 fn payload_path_for(path: &Path) -> PathBuf {
