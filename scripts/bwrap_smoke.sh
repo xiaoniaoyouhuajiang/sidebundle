@@ -164,13 +164,12 @@ if [[ -n "$java_bin" ]]; then
   java_ld_path="${java_home}/lib/jli:${java_home}/lib/server:${LD_LIBRARY_PATH:-}"
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
   echo "java trace_backend=$TRACE_BACKEND"
-  run_bundle "bundle java" "$cli" create \
+  run_bundle "bundle java" env LD_LIBRARY_PATH="${java_ld_path}" "$cli" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
     --out-dir "$OUT" \
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND" \
-    --env "LD_LIBRARY_PATH=${java_ld_path}" \
     "${copy_args[@]}"
   echo "find libstdc++ in bundle (java):"
   find "$java_out/payload" -maxdepth 4 -name 'libstdc++.so*' -type f -print || true
