@@ -144,7 +144,36 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .with_resolver_set(host_resolvers.clone())
         .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(backend) = host_backend.clone() {
-        let tracer = TraceCollector::new().with_backend(backend);
+        let mut env_pairs: Vec<(OsString, OsString)> = Vec::new();
+        if let Ok(val) = std::env::var("LD_LIBRARY_PATH") {
+            if !val.is_empty() {
+                env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(val)));
+            }
+        }
+        // Heuristic: if JAVA_HOME is set, expose its private lib paths so java trace works under bwrap.
+        if let Ok(java_home) = std::env::var("JAVA_HOME") {
+            let mut parts = Vec::new();
+            parts.push(format!("{java_home}/lib"));
+            parts.push(format!("{java_home}/lib/server"));
+            parts.push(format!("{java_home}/lib/jli"));
+            let mut combined = parts.join(":");
+            if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+                if !existing.is_empty() {
+                    combined.push(':');
+                    combined.push_str(&existing);
+                }
+            }
+            env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(combined)));
+            env_pairs.push((OsString::from("JAVA_HOME"), OsString::from(java_home)));
+        }
+
+        let tracer = if env_pairs.is_empty() {
+            TraceCollector::new().with_backend(backend)
+        } else {
+            TraceCollector::new()
+                .with_backend(backend)
+                .with_env(env_pairs)
+        };
         builder = builder.with_tracer(tracer);
     }
 
@@ -821,13 +850,6 @@ fn copy_dir_into_closure(
         if meta.is_dir() {
             continue;
         }
-        if meta.file_type().is_symlink() {
-            debug!(
-                "copy-dir: skipping symlink {} (not yet supported)",
-                dirent.path().display()
-            );
-            continue;
-        }
         let rel = dirent.path().strip_prefix(source).with_context(|| {
             format!(
                 "failed to strip {} prefix from {}",
@@ -844,13 +866,35 @@ fn copy_dir_into_closure(
             dest.push(dest_root);
         }
         dest.push(rel);
-        if closure.files.iter().any(|f| f.destination == dest) {
-            continue;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(dirent.path()).with_context(|| {
+                format!("failed to read symlink target {}", dirent.path().display())
+            })?;
+            let bundle_target = if target.is_absolute() {
+                payload_path_for(&target)
+            } else if let Some(parent) = dest.parent() {
+                parent.join(&target)
+            } else {
+                PathBuf::from("payload").join(&target)
+            };
+            if !closure
+                .symlinks
+                .iter()
+                .any(|s| s.destination == dest && s.bundle_target == bundle_target)
+            {
+                closure
+                    .symlinks
+                    .push(ResolvedSymlink::new(&dest, bundle_target));
+            }
+        } else {
+            if closure.files.iter().any(|f| f.destination == dest) {
+                continue;
+            }
+            let digest = compute_digest(dirent.path())?;
+            closure
+                .files
+                .push(ResolvedFile::new(dirent.path(), dest, digest));
         }
-        let digest = compute_digest(dirent.path())?;
-        closure
-            .files
-            .push(ResolvedFile::new(dirent.path(), dest, digest));
     }
     Ok(())
 }
