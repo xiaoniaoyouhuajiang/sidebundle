@@ -38,7 +38,7 @@ ensure_cli() {
     if [[ -x "$c" ]]; then
       echo "$c"
       return
-    }
+    fi
   done
   echo "building sidebundle-cli..."
   cargo build --release -p sidebundle-cli
