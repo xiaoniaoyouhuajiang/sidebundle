@@ -20,15 +20,16 @@ jobs:
           image: ubuntu:22.04
           options: --privileged --security-opt seccomp=unconfined
           run: |
-            set -euo pipefail
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              bubblewrap sudo curl build-essential \
-              nodejs python3 openjdk-17-jdk \
-              ca-certificates git pkg-config libssl-dev
-            # Install Rust via rustup
-            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
-            export PATH="$HOME/.cargo/bin:$PATH"
-            cd /github/workspace
-            cargo build --release -p sidebundle-cli
-            scripts/bwrap_smoke.sh
+            bash -eo pipefail -c '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                bubblewrap sudo curl build-essential \
+                nodejs python3 openjdk-17-jdk \
+                ca-certificates git pkg-config libssl-dev bash
+              # Install Rust via rustup
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cd /github/workspace
+              cargo build --release -p sidebundle-cli
+              scripts/bwrap_smoke.sh
+            '
