@@ -25,6 +25,14 @@ arch_lib_dir() {
   esac
 }
 
+arch_lib_dir_root() {
+  case "$ARCH" in
+    x86_64) echo "/lib/x86_64-linux-gnu" ;;
+    aarch64|arm64) echo "/lib/aarch64-linux-gnu" ;;
+    *) echo "" ;;
+  esac
+}
+
 ensure_cli() {
   if [[ -n "${SB_CLI:-}" ]]; then
     echo "$SB_CLI"
@@ -67,6 +75,7 @@ run_bundle() {
 cli="$(ensure_cli)"
 ensure_bwrap
 arch_lib="$(arch_lib_dir)"
+arch_root_lib="$(arch_lib_dir_root)"
 
 # Node
 node_bin="${SB_NODE_BIN:-$(command -v node || true)}"
@@ -114,7 +123,12 @@ fi
 # Java
 java_bin="${SB_JAVA_BIN:-$(command -v java || true)}"
 if [[ -n "$java_bin" ]]; then
-  java_home="${JAVA_HOME:-$(readlink -f "$(dirname "$java_bin")/..")}"
+  if [[ -n "${JAVA_HOME:-}" ]]; then
+    java_home="$(readlink -f "$JAVA_HOME")"
+  else
+    resolved_java="$(readlink -f "$java_bin")"
+    java_home="$(dirname "$(dirname "$resolved_java")")"
+  fi
   sec_target="$(readlink -f "$java_home/conf/security/java.security" || true)"
   sec_src=""
   sec_dest="$java_home/conf/security"
@@ -125,6 +139,7 @@ if [[ -n "$java_bin" ]]; then
   copy_args=(--copy-dir "$java_home")
   [[ -n "$sec_src" ]] && copy_args+=(--copy-dir "$sec_src:$sec_dest")
   [[ -n "$arch_lib" && -d "$arch_lib" ]] && copy_args+=(--copy-dir "$arch_lib")
+  [[ -n "$arch_root_lib" && -d "$arch_root_lib" ]] && copy_args+=(--copy-dir "$arch_root_lib")
   run_bundle "bundle java" "$cli" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
