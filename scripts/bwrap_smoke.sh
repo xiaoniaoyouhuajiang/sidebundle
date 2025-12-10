@@ -17,6 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/target/smoke-$ARCH}"
+TRACE_BACKEND="${SB_TRACE_BACKEND:-combined}"
 mkdir -p "$OUT"
 
 if [[ "${SB_DEBUG:-0}" != "0" ]]; then
@@ -98,12 +99,13 @@ if [[ -n "$node_bin" ]]; then
   node_share="${SB_NODE_SHARE:-/usr/share/nodejs}"
   node_copy=()
   [[ -d "$node_share" ]] && node_copy+=(--copy-dir "$node_share")
+  echo "node trace_backend=$TRACE_BACKEND"
   run_bundle "bundle node" "$cli" create \
     --from-host "$node_bin" \
     --name node \
     --out-dir "$OUT" \
     --run-mode bwrap \
-    --trace-backend off \
+    --trace-backend "$TRACE_BACKEND" \
     "${node_copy[@]}"
   run_bundle "run node" "$node_out/bin/node" -e "console.log('smoke-node')"
 else
@@ -119,12 +121,13 @@ import sysconfig
 print(sysconfig.get_paths()['stdlib'])
 PY
 )}"
+  echo "python trace_backend=$TRACE_BACKEND"
   run_bundle "bundle python" "$cli" create \
     --from-host "$py_bin::trace=-c 'import encodings;import sys;sys.exit(0)'" \
     --name python3 \
     --out-dir "$OUT" \
     --run-mode bwrap \
-    --trace-backend off \
+    --trace-backend "$TRACE_BACKEND" \
     --copy-dir "$py_stdlib"
   run_bundle "run python" "$py_out/bin/python3" - <<'PY'
 import sys, encodings
@@ -158,12 +161,13 @@ if [[ -n "$java_bin" ]]; then
     copy_args+=(--copy-dir "$link")
   done
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
+  echo "java trace_backend=$TRACE_BACKEND"
   run_bundle "bundle java" "$cli" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
     --out-dir "$OUT" \
     --run-mode bwrap \
-    --trace-backend off \
+    --trace-backend "$TRACE_BACKEND" \
     "${copy_args[@]}"
   echo "find libstdc++ in bundle (java):"
   find "$java_out/payload" -maxdepth 4 -name 'libstdc++.so*' -type f -print || true
