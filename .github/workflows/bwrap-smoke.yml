@@ -18,7 +18,9 @@ jobs:
         uses: addnab/docker-run-action@v3
         with:
           image: ubuntu:22.04
-          options: --privileged --security-opt seccomp=unconfined
+          # Mount the checked-out repo into the container and run with needed privs.
+          options: --privileged --security-opt seccomp=unconfined -v ${{ github.workspace }}:/github/workspace
+          workdir: /github/workspace
           run: |
             bash -eo pipefail -c '
               apt-get update
