@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple bwrap smoke tests for Node/Python/Java bundles.
-# Uses host runtimes; override paths via env vars:
+# bwrap smoke tests for Node/Python/Java.
+# Must be run in an environment where bwrap can create user/mount namespaces.
+# If run on GitHub Actions, the workflow runs inside a privileged Docker container.
+#
+# Override defaults via env:
 #   SB_NODE_BIN, SB_NODE_SHARE
-#   SB_PY_BIN (python3), SB_PY_STDLIB
+#   SB_PY_BIN, SB_PY_STDLIB
 #   SB_JAVA_BIN, JAVA_HOME
 #   SB_CLI (path to sidebundle-cli)
-# Requires bubblewrap installed; will use sudo for running bundles.
+#   OUT (output dir)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="$(uname -m)"
@@ -35,7 +38,7 @@ ensure_cli() {
     if [[ -x "$c" ]]; then
       echo "$c"
       return
-    fi
+    }
   done
   echo "building sidebundle-cli..."
   cargo build --release -p sidebundle-cli
@@ -43,11 +46,15 @@ ensure_cli() {
 }
 
 ensure_bwrap() {
-  if command -v bwrap >/dev/null 2>&1; then
-    return
+  if ! command -v bwrap >/dev/null 2>&1; then
+    echo "bubblewrap (bwrap) not found in PATH" >&2
+    exit 1
   fi
-  echo "bubblewrap (bwrap) not found in PATH" >&2
-  exit 1
+  # Minimal capability check: can we unshare user/mount and bind /?
+  if ! bwrap --unshare-user --unshare-ipc --unshare-pid --ro-bind / / true 2>/dev/null; then
+    echo "bwrap capability check failed (user/mount namespaces not available)" >&2
+    exit 1
+  fi
 }
 
 run_bundle() {
@@ -59,11 +66,6 @@ run_bundle() {
 
 cli="$(ensure_cli)"
 ensure_bwrap
-sudo_cmd="$(command -v sudo || true)"
-if [[ -z "$sudo_cmd" ]]; then
-  sudo_cmd=""
-fi
-
 arch_lib="$(arch_lib_dir)"
 
 # Node
@@ -80,7 +82,7 @@ if [[ -n "$node_bin" ]]; then
     --run-mode bwrap \
     --trace-backend off \
     "${node_copy[@]}"
-  run_bundle "run node" $sudo_cmd "$node_out/bin/node" -e "console.log('smoke-node')"
+  run_bundle "run node" "$node_out/bin/node" -e "console.log('smoke-node')"
 else
   echo "node not found; skipping node test"
 fi
@@ -101,7 +103,7 @@ PY
     --run-mode bwrap \
     --trace-backend off \
     --copy-dir "$py_stdlib"
-  run_bundle "run python" $sudo_cmd "$py_out/bin/python3" - <<'PY'
+  run_bundle "run python" "$py_out/bin/python3" - <<'PY'
 import sys, encodings
 print("smoke-python", sys.version.split()[0])
 PY
@@ -130,7 +132,7 @@ if [[ -n "$java_bin" ]]; then
     --run-mode bwrap \
     --trace-backend off \
     "${copy_args[@]}"
-  run_bundle "run java version+settings" $sudo_cmd "$java_out/bin/java" -XshowSettings:properties -version
+  run_bundle "run java version+settings" "$java_out/bin/java" -XshowSettings:properties -version
   if command -v javac >/dev/null 2>&1; then
     tmpdir="$(mktemp -d)"
     cat >"$tmpdir/Hello.java" <<'EOF'
@@ -143,7 +145,7 @@ public class Hello {
 }
 EOF
     javac -d "$tmpdir" "$tmpdir/Hello.java"
-    run_bundle "run java class" $sudo_cmd "$java_out/bin/java" -cp "$tmpdir" Hello
+    run_bundle "run java class" "$java_out/bin/java" -cp "$tmpdir" Hello
     rm -rf "$tmpdir"
   else
     echo "javac not found; skipping java class run"
