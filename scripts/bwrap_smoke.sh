@@ -163,9 +163,10 @@ if [[ -n "$java_bin" ]]; then
   # Ensure JDK private libs are discoverable during trace inside bwrap.
   java_ld_path="${java_home}/lib/jli:${java_home}/lib/server:${LD_LIBRARY_PATH:-}"
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
-  echo "java trace_backend=$TRACE_BACKEND"
-  run_bundle "bundle java" env LD_LIBRARY_PATH="${java_ld_path}" "$cli" create \
-    --from-host "$java_bin::trace=-version" \
+  java_trace_cmd="env LD_LIBRARY_PATH=${java_ld_path} -version"
+  echo "java trace_backend=$TRACE_BACKEND trace_cmd=${java_trace_cmd}"
+  run_bundle "bundle java" "$cli" create \
+    --from-host "$java_bin::trace=${java_trace_cmd}" \
     --name java \
     --out-dir "$OUT" \
     --run-mode bwrap \
