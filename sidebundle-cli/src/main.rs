@@ -848,6 +848,10 @@ fn copy_dir_into_closure(
         }
         dest.push(rel);
         if meta.file_type().is_symlink() {
+            // If a file for this destination already exists, don't replace it with a symlink.
+            if closure.files.iter().any(|f| f.destination == dest) {
+                continue;
+            }
             let target = fs::read_link(dirent.path()).with_context(|| {
                 format!("failed to read symlink target {}", dirent.path().display())
             })?;
