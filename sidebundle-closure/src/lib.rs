@@ -327,6 +327,12 @@ impl ClosureBuilder {
         self
     }
 
+    /// Override LD_LIBRARY_PATH search paths for linker tracing.
+    pub fn with_ld_library_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.ld_library_paths = paths;
+        self
+    }
+
     pub fn with_origin_path(mut self, origin: Origin, path: Vec<PathBuf>) -> Self {
         self.origin_paths.insert(origin, path);
         self

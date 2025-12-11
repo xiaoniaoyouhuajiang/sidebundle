@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsString};
 use std::fmt::Write as _;
@@ -25,7 +25,7 @@ use sidebundle_closure::{
 };
 use sidebundle_core::{
     AuxvEntry, BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin,
-    ResolvedFile, RunMode, RuntimeMetadata, SystemInfo, TargetTriple,
+    ResolvedFile, ResolvedSymlink, RunMode, RuntimeMetadata, SystemInfo, TargetTriple,
 };
 use sidebundle_packager::Packager;
 
@@ -144,7 +144,17 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .with_resolver_set(host_resolvers.clone())
         .with_allow_gpu_libs(allow_gpu_libs);
     if let Some(backend) = host_backend.clone() {
-        let tracer = TraceCollector::new().with_backend(backend);
+        let (tracer_env, ld_paths_override) = derive_trace_env(&spec);
+        let tracer = if tracer_env.is_empty() {
+            TraceCollector::new().with_backend(backend)
+        } else {
+            TraceCollector::new()
+                .with_backend(backend)
+                .with_env(tracer_env)
+        };
+        if let Some(paths) = ld_paths_override {
+            builder = builder.with_ld_library_paths(paths);
+        }
         builder = builder.with_tracer(tracer);
     }
 
@@ -191,6 +201,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
         .context("failed to apply --copy-dir entries")?;
     apply_env_overrides(&mut closure, &set_env);
+    sanitize_symlinks(&mut closure);
 
     if closure.entry_plans.is_empty() {
         bail!("no executable entries were collected from host or image inputs");
@@ -815,17 +826,9 @@ fn copy_dir_into_closure(
 
     for dirent in WalkDir::new(source).follow_links(false).into_iter() {
         let dirent = dirent.with_context(|| format!("failed to walk {}", source.display()))?;
-        let meta = dirent
-            .metadata()
-            .with_context(|| format!("failed to stat {}", dirent.path().display()))?;
+        let meta = fs::symlink_metadata(dirent.path())
+            .with_context(|| format!("failed to lstat {}", dirent.path().display()))?;
         if meta.is_dir() {
-            continue;
-        }
-        if meta.file_type().is_symlink() {
-            debug!(
-                "copy-dir: skipping symlink {} (not yet supported)",
-                dirent.path().display()
-            );
             continue;
         }
         let rel = dirent.path().strip_prefix(source).with_context(|| {
@@ -844,15 +847,118 @@ fn copy_dir_into_closure(
             dest.push(dest_root);
         }
         dest.push(rel);
-        if closure.files.iter().any(|f| f.destination == dest) {
-            continue;
+        if meta.file_type().is_symlink() {
+            // If a file for this destination already exists, don't replace it with a symlink.
+            if closure.files.iter().any(|f| f.destination == dest) {
+                continue;
+            }
+            let target = fs::read_link(dirent.path()).with_context(|| {
+                format!("failed to read symlink target {}", dirent.path().display())
+            })?;
+            // Resolve relative targets using the host path to avoid creating self-referential
+            // links when directories inside the bundle are also symlinks.
+            let host_target = if target.is_absolute() {
+                target
+            } else if let Some(parent) = dirent.path().parent() {
+                parent.join(&target)
+            } else {
+                target
+            };
+            let host_target_norm = normalize_rel_path(&host_target);
+            let mut bundle_target = payload_path_for(&host_target_norm);
+            let normalized_dest = normalize_rel_path(&dest);
+            let normalized_target = normalize_rel_path(&bundle_target);
+            let creates_cycle =
+                would_create_symlink_cycle(&normalized_dest, &normalized_target, &closure.symlinks);
+            if creates_cycle || normalized_dest == normalized_target {
+                // Avoid self-referential or cyclic symlinks; fall back to copying the file contents.
+                if closure.files.iter().any(|f| f.destination == dest) {
+                    continue;
+                }
+                let source_for_copy =
+                    fs::canonicalize(dirent.path()).unwrap_or_else(|_| dirent.path().to_path_buf());
+                let digest = compute_digest(&source_for_copy)?;
+                closure
+                    .files
+                    .push(ResolvedFile::new(source_for_copy, dest, digest));
+                continue;
+            }
+            bundle_target = normalized_target;
+            if !closure
+                .symlinks
+                .iter()
+                .any(|s| s.destination == dest && s.bundle_target == bundle_target)
+            {
+                closure
+                    .symlinks
+                    .push(ResolvedSymlink::new(&dest, bundle_target));
+            }
+        } else {
+            if closure.files.iter().any(|f| f.destination == dest) {
+                continue;
+            }
+            let digest = compute_digest(dirent.path())?;
+            closure
+                .files
+                .push(ResolvedFile::new(dirent.path(), dest, digest));
         }
-        let digest = compute_digest(dirent.path())?;
-        closure
-            .files
-            .push(ResolvedFile::new(dirent.path(), dest, digest));
     }
     Ok(())
+}
+
+fn normalize_rel_path(path: &Path) -> PathBuf {
+    let mut stack: Vec<PathBuf> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                stack.pop();
+            }
+            std::path::Component::Normal(part) => stack.push(PathBuf::from(part)),
+            std::path::Component::RootDir => {
+                stack.clear();
+                stack.push(PathBuf::from("/"));
+            }
+            std::path::Component::Prefix(_) => {
+                stack.clear();
+                stack.push(PathBuf::from(comp.as_os_str()));
+            }
+        }
+    }
+    let mut out = PathBuf::new();
+    for part in stack.iter() {
+        out.push(part);
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn would_create_symlink_cycle(dest: &Path, target: &Path, existing: &[ResolvedSymlink]) -> bool {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut current_dest = dest.to_path_buf();
+    let mut current_target = target.to_path_buf();
+    loop {
+        if current_target == *dest {
+            return true;
+        }
+        if !seen.insert(current_dest.clone()) {
+            return true;
+        }
+        if let Some(next) = existing
+            .iter()
+            .find(|s| s.destination == current_target)
+            .map(|s| s.bundle_target.clone())
+        {
+            current_dest = current_target;
+            current_target = next;
+            continue;
+        }
+        break;
+    }
+    false
 }
 
 fn payload_path_for(path: &Path) -> PathBuf {
@@ -896,6 +1002,58 @@ fn mark_existing(existing: &mut HashSet<PathBuf>, path: &Path) {
             break;
         }
     }
+}
+
+fn sanitize_symlinks(closure: &mut DependencyClosure) {
+    // Prefer files over symlinks: drop any symlink whose destination already has a file.
+    if !closure.symlinks.is_empty() {
+        let file_dests: HashSet<PathBuf> = closure
+            .files
+            .iter()
+            .map(|f| f.destination.clone())
+            .collect();
+        closure
+            .symlinks
+            .retain(|s| !file_dests.contains(&s.destination));
+    }
+
+    if closure.symlinks.is_empty() {
+        return;
+    }
+
+    let mut map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for link in &closure.symlinks {
+        map.insert(link.destination.clone(), link.bundle_target.clone());
+    }
+
+    let mut keep: Vec<ResolvedSymlink> = Vec::new();
+    for link in closure.symlinks.iter() {
+        if symlink_has_cycle(&link.destination, &map) {
+            warn!(
+                "dropping symlink {} -> {} (cycle detected)",
+                link.destination.display(),
+                link.bundle_target.display()
+            );
+        } else {
+            keep.push(link.clone());
+        }
+    }
+    closure.symlinks = keep;
+}
+
+fn symlink_has_cycle(start: &Path, map: &HashMap<PathBuf, PathBuf>) -> bool {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut current = start.to_path_buf();
+    while let Some(next) = map.get(&current) {
+        if !seen.insert(current.clone()) {
+            return true;
+        }
+        if next == start {
+            return true;
+        }
+        current = next.clone();
+    }
+    false
 }
 
 struct ImageClosureResult {
@@ -1554,6 +1712,60 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
     }
 }
 
+/// Heuristic env construction for trace runs (host inputs).
+fn derive_trace_env(spec: &BundleSpec) -> (Vec<(OsString, OsString)>, Option<Vec<PathBuf>>) {
+    let mut env_pairs: Vec<(OsString, OsString)> = Vec::new();
+    let mut ld_paths_override: Option<Vec<PathBuf>> = None;
+
+    let existing_ld = std::env::var("LD_LIBRARY_PATH").ok();
+    if let Some(val) = existing_ld.as_ref().filter(|s| !s.is_empty()) {
+        env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(val)));
+    }
+
+    let mut java_home: Option<PathBuf> = std::env::var("JAVA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    if java_home.is_none() {
+        for entry in &spec.entries {
+            if entry.logical.origin() != &Origin::Host {
+                continue;
+            }
+            let path = entry.logical.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == "java" || name == "javac" {
+                    if let Ok(real) = std::fs::canonicalize(path) {
+                        if let Some(home) = real.parent().and_then(|p| p.parent()) {
+                            java_home = Some(home.to_path_buf());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(home) = java_home {
+        let mut parts: Vec<String> = vec![
+            home.join("lib").to_string_lossy().into_owned(),
+            home.join("lib/server").to_string_lossy().into_owned(),
+            home.join("lib/jli").to_string_lossy().into_owned(),
+        ];
+        if let Some(val) = existing_ld {
+            if !val.is_empty() {
+                parts.push(val);
+            }
+        }
+        let joined = parts.join(":");
+        env_pairs.push((OsString::from("LD_LIBRARY_PATH"), OsString::from(&joined)));
+        env_pairs.push((OsString::from("JAVA_HOME"), OsString::from(home)));
+        ld_paths_override = Some(parts.into_iter().map(PathBuf::from).collect());
+    }
+
+    (env_pairs, ld_paths_override)
+}
+
 fn include_java_runtime(
     rootfs: &Path,
     origin: &Origin,
@@ -1756,6 +1968,7 @@ fn describe_status(status: &EntryValidationStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sidebundle_core::{DependencyClosure, ResolvedFile, ResolvedSymlink};
 
     #[test]
     fn parse_create_cmd_with_host_entries() {
@@ -1792,6 +2005,47 @@ mod tests {
             }
             _ => panic!("unexpected command variant"),
         }
+    }
+
+    fn file(src: &str, dst: &str) -> ResolvedFile {
+        ResolvedFile {
+            source: PathBuf::from(src),
+            destination: PathBuf::from(dst),
+            digest: "deadbeef".into(),
+        }
+    }
+
+    fn symlink(dst: &str, target: &str) -> ResolvedSymlink {
+        ResolvedSymlink {
+            destination: PathBuf::from(dst),
+            bundle_target: PathBuf::from(target),
+        }
+    }
+
+    #[test]
+    fn symlink_sanitize_prefers_files_and_drops_cycles() {
+        let mut closure = DependencyClosure {
+            files: vec![file("/host/a", "payload/usr/lib/libjli.so")],
+            symlinks: vec![
+                symlink("payload/usr/lib/libjli.so", "payload/usr/lib/libjli.so.1"), // should be dropped (file exists)
+                symlink("payload/x", "payload/y"),
+                symlink("payload/y", "payload/x"), // cycle x -> y -> x
+                symlink("payload/z", "payload/w"), // kept
+            ],
+            ..Default::default()
+        };
+
+        sanitize_symlinks(&mut closure);
+
+        // File preserved
+        assert_eq!(closure.files.len(), 1);
+        // Only non-cyclic, non-conflicting symlink should remain.
+        assert_eq!(closure.symlinks.len(), 1);
+        assert_eq!(closure.symlinks[0].destination, PathBuf::from("payload/z"));
+        assert_eq!(
+            closure.symlinks[0].bundle_target,
+            PathBuf::from("payload/w")
+        );
     }
 }
 #[derive(Subcommand)]

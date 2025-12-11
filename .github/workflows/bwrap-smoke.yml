@@ -1,0 +1,41 @@
+name: bwrap-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke tests in privileged container
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ubuntu:22.04
+          # Mount the checked-out repo into the container and run with needed privs.
+          options: --privileged --security-opt seccomp=unconfined -v ${{ github.workspace }}:/github/workspace
+          workdir: /github/workspace
+          run: |
+            bash -eo pipefail -c '
+              mkdir -p /github/workspace/target
+              APT_LOG=/github/workspace/target/apt-setup.log
+              echo "Setting up build environment (logs: $APT_LOG)"
+              apt-get update -qq >>"$APT_LOG" 2>&1
+              DEBIAN_FRONTEND=noninteractive apt-get install -yqq \
+                bubblewrap sudo curl build-essential \
+                nodejs python3 openjdk-17-jdk \
+                ca-certificates git pkg-config libssl-dev bash >>"$APT_LOG" 2>&1
+              # Install Rust via rustup
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              cd /github/workspace
+              echo "Building sidebundle-cli (logs: /github/workspace/target/cargo-build.log)"
+              cargo build --release -p sidebundle-cli >/github/workspace/target/cargo-build.log 2>&1
+              SB_LOG_LEVEL=debug scripts/bwrap_smoke.sh
+            '
