@@ -33,5 +33,5 @@ jobs:
               export PATH="$HOME/.cargo/bin:$PATH"
               cd /github/workspace
               cargo build --release -p sidebundle-cli
-              scripts/bwrap_smoke.sh
+              SB_QUIET=1 SB_LOG=/github/workspace/target/smoke.log scripts/bwrap_smoke.sh
             '

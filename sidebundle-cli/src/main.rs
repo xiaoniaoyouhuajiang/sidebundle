@@ -860,15 +860,19 @@ fn copy_dir_into_closure(
             };
             let normalized_dest = normalize_rel_path(&dest);
             let normalized_target = normalize_rel_path(&bundle_target);
-            if normalized_dest == normalized_target {
-                // Avoid self-referential symlink loops; fall back to copying the file contents.
+            let creates_cycle =
+                would_create_symlink_cycle(&normalized_dest, &normalized_target, &closure.symlinks);
+            if creates_cycle || normalized_dest == normalized_target {
+                // Avoid self-referential or cyclic symlinks; fall back to copying the file contents.
                 if closure.files.iter().any(|f| f.destination == dest) {
                     continue;
                 }
-                let digest = compute_digest(dirent.path())?;
+                let source_for_copy =
+                    fs::canonicalize(dirent.path()).unwrap_or_else(|_| dirent.path().to_path_buf());
+                let digest = compute_digest(&source_for_copy)?;
                 closure
                     .files
-                    .push(ResolvedFile::new(dirent.path(), dest, digest));
+                    .push(ResolvedFile::new(source_for_copy, dest, digest));
                 continue;
             }
             bundle_target = normalized_target;
@@ -922,6 +926,31 @@ fn normalize_rel_path(path: &Path) -> PathBuf {
     } else {
         out
     }
+}
+
+fn would_create_symlink_cycle(dest: &Path, target: &Path, existing: &[ResolvedSymlink]) -> bool {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut current_dest = dest.to_path_buf();
+    let mut current_target = target.to_path_buf();
+    loop {
+        if current_target == *dest {
+            return true;
+        }
+        if !seen.insert(current_dest.clone()) {
+            return true;
+        }
+        if let Some(next) = existing
+            .iter()
+            .find(|s| s.destination == current_target)
+            .map(|s| s.bundle_target.clone())
+        {
+            current_dest = current_target;
+            current_target = next;
+            continue;
+        }
+        break;
+    }
+    false
 }
 
 fn payload_path_for(path: &Path) -> PathBuf {

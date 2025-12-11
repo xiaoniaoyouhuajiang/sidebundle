@@ -18,10 +18,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/target/smoke-$ARCH}"
 TRACE_BACKEND="${SB_TRACE_BACKEND:-combined}"
-mkdir -p "$OUT"
+LOG_FILE="${SB_LOG:-$OUT/smoke.log}"
+mkdir -p "$OUT" "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
 
 if [[ "${SB_DEBUG:-0}" != "0" ]]; then
   set -x
+fi
+
+if [[ "${SB_QUIET:-0}" != "0" ]]; then
+  trap 'status=$?; if [[ $status -ne 0 ]]; then echo "smoke failed (exit $status), showing last 200 lines from $LOG_FILE"; tail -n 200 "$LOG_FILE" || true; fi' EXIT
 fi
 
 arch_lib_dir() {
@@ -82,8 +88,18 @@ ensure_bwrap() {
 run_bundle() {
   local name="$1"; shift
   local cmd=("$@")
-  echo "==> $name: ${cmd[*]}"
-  "${cmd[@]}"
+  if [[ "${SB_QUIET:-0}" != "0" ]]; then
+    echo "==> $name (quiet; logs -> $LOG_FILE)"
+    {
+      echo "===== $name ====="
+      echo "\$ ${cmd[*]}"
+      "${cmd[@]}"
+      echo "===== end $name ====="
+    } >>"$LOG_FILE" 2>&1
+  else
+    echo "==> $name: ${cmd[*]}"
+    "${cmd[@]}"
+  fi
 }
 
 cli="$(ensure_cli)"
