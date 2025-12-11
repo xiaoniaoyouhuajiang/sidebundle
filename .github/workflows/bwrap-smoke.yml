@@ -23,15 +23,18 @@ jobs:
           workdir: /github/workspace
           run: |
             bash -eo pipefail -c '
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              mkdir -p /github/workspace/target
+              APT_LOG=/github/workspace/target/apt-setup.log
+              echo "Setting up build environment (logs: $APT_LOG)"
+              apt-get update -qq >>"$APT_LOG" 2>&1
+              DEBIAN_FRONTEND=noninteractive apt-get install -yqq \
                 bubblewrap sudo curl build-essential \
                 nodejs python3 openjdk-17-jdk \
-                ca-certificates git pkg-config libssl-dev bash
+                ca-certificates git pkg-config libssl-dev bash >>"$APT_LOG" 2>&1
               # Install Rust via rustup
               curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
               export PATH="$HOME/.cargo/bin:$PATH"
               cd /github/workspace
               cargo build --release -p sidebundle-cli
-              SB_QUIET=1 SB_LOG=/github/workspace/target/smoke.log scripts/bwrap_smoke.sh
+              scripts/bwrap_smoke.sh
             '

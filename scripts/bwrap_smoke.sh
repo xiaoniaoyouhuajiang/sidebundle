@@ -19,8 +19,11 @@ ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/target/smoke-$ARCH}"
 TRACE_BACKEND="${SB_TRACE_BACKEND:-combined}"
 LOG_FILE="${SB_LOG:-$OUT/smoke.log}"
-mkdir -p "$OUT" "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
+mkdir -p "$OUT"
+if [[ "${SB_QUIET:-0}" != "0" ]]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+fi
 
 if [[ "${SB_DEBUG:-0}" != "0" ]]; then
   set -x
