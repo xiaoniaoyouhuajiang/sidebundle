@@ -201,7 +201,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
         .context("failed to apply --copy-dir entries")?;
     apply_env_overrides(&mut closure, &set_env);
-    drop_symlink_cycles(&mut closure);
+    sanitize_symlinks(&mut closure);
 
     if closure.entry_plans.is_empty() {
         bail!("no executable entries were collected from host or image inputs");
@@ -1004,10 +1004,23 @@ fn mark_existing(existing: &mut HashSet<PathBuf>, path: &Path) {
     }
 }
 
-fn drop_symlink_cycles(closure: &mut DependencyClosure) {
+fn sanitize_symlinks(closure: &mut DependencyClosure) {
+    // Prefer files over symlinks: drop any symlink whose destination already has a file.
+    if !closure.symlinks.is_empty() {
+        let file_dests: HashSet<PathBuf> = closure
+            .files
+            .iter()
+            .map(|f| f.destination.clone())
+            .collect();
+        closure
+            .symlinks
+            .retain(|s| !file_dests.contains(&s.destination));
+    }
+
     if closure.symlinks.is_empty() {
         return;
     }
+
     let mut map: HashMap<PathBuf, PathBuf> = HashMap::new();
     for link in &closure.symlinks {
         map.insert(link.destination.clone(), link.bundle_target.clone());
@@ -1955,6 +1968,7 @@ fn describe_status(status: &EntryValidationStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sidebundle_core::{DependencyClosure, ResolvedFile, ResolvedSymlink};
 
     #[test]
     fn parse_create_cmd_with_host_entries() {
@@ -1991,6 +2005,47 @@ mod tests {
             }
             _ => panic!("unexpected command variant"),
         }
+    }
+
+    fn file(src: &str, dst: &str) -> ResolvedFile {
+        ResolvedFile {
+            source: PathBuf::from(src),
+            destination: PathBuf::from(dst),
+            digest: "deadbeef".into(),
+        }
+    }
+
+    fn symlink(dst: &str, target: &str) -> ResolvedSymlink {
+        ResolvedSymlink {
+            destination: PathBuf::from(dst),
+            bundle_target: PathBuf::from(target),
+        }
+    }
+
+    #[test]
+    fn symlink_sanitize_prefers_files_and_drops_cycles() {
+        let mut closure = DependencyClosure {
+            files: vec![file("/host/a", "payload/usr/lib/libjli.so")],
+            symlinks: vec![
+                symlink("payload/usr/lib/libjli.so", "payload/usr/lib/libjli.so.1"), // should be dropped (file exists)
+                symlink("payload/x", "payload/y"),
+                symlink("payload/y", "payload/x"), // cycle x -> y -> x
+                symlink("payload/z", "payload/w"), // kept
+            ],
+            ..Default::default()
+        };
+
+        sanitize_symlinks(&mut closure);
+
+        // File preserved
+        assert_eq!(closure.files.len(), 1);
+        // Only non-cyclic, non-conflicting symlink should remain.
+        assert_eq!(closure.symlinks.len(), 1);
+        assert_eq!(closure.symlinks[0].destination, PathBuf::from("payload/z"));
+        assert_eq!(
+            closure.symlinks[0].bundle_target,
+            PathBuf::from("payload/w")
+        );
     }
 }
 #[derive(Subcommand)]
