@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsString};
 use std::fmt::Write as _;
@@ -201,6 +201,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
         .context("failed to apply --copy-dir entries")?;
     apply_env_overrides(&mut closure, &set_env);
+    drop_symlink_cycles(&mut closure);
 
     if closure.entry_plans.is_empty() {
         bail!("no executable entries were collected from host or image inputs");
@@ -998,6 +999,45 @@ fn mark_existing(existing: &mut HashSet<PathBuf>, path: &Path) {
             break;
         }
     }
+}
+
+fn drop_symlink_cycles(closure: &mut DependencyClosure) {
+    if closure.symlinks.is_empty() {
+        return;
+    }
+    let mut map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for link in &closure.symlinks {
+        map.insert(link.destination.clone(), link.bundle_target.clone());
+    }
+
+    let mut keep: Vec<ResolvedSymlink> = Vec::new();
+    for link in closure.symlinks.iter() {
+        if symlink_has_cycle(&link.destination, &map) {
+            warn!(
+                "dropping symlink {} -> {} (cycle detected)",
+                link.destination.display(),
+                link.bundle_target.display()
+            );
+        } else {
+            keep.push(link.clone());
+        }
+    }
+    closure.symlinks = keep;
+}
+
+fn symlink_has_cycle(start: &Path, map: &HashMap<PathBuf, PathBuf>) -> bool {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut current = start.to_path_buf();
+    while let Some(next) = map.get(&current) {
+        if !seen.insert(current.clone()) {
+            return true;
+        }
+        if next == start {
+            return true;
+        }
+        current = next.clone();
+    }
+    false
 }
 
 struct ImageClosureResult {
