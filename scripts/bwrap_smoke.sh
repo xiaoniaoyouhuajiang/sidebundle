@@ -197,7 +197,9 @@ if [[ -n "$java_bin" ]]; then
   ldd "$java_out/bin/java" || true
   run_bundle "run java version+settings" "$java_out/bin/java" -XshowSettings:properties -version
   if command -v javac >/dev/null 2>&1; then
-    tmpdir="$(mktemp -d)"
+    tmpdir="$java_out/tmp-classes"
+    rm -rf "$tmpdir"
+    mkdir -p "$tmpdir"
     cat >"$tmpdir/Hello.java" <<'EOF'
 public class Hello {
     public static void main(String[] args) {
@@ -209,7 +211,6 @@ public class Hello {
 EOF
     javac -d "$tmpdir" "$tmpdir/Hello.java"
     run_bundle "run java class" "$java_out/bin/java" -cp "$tmpdir" Hello
-    rm -rf "$tmpdir"
   else
     echo "javac not found; skipping java class run"
   fi
