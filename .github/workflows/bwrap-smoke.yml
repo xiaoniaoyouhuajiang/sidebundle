@@ -35,6 +35,7 @@ jobs:
               curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
               export PATH="$HOME/.cargo/bin:$PATH"
               cd /github/workspace
-              cargo build --release -p sidebundle-cli
-              scripts/bwrap_smoke.sh
+              echo "Building sidebundle-cli (logs: /github/workspace/target/cargo-build.log)"
+              cargo build --release -p sidebundle-cli >/github/workspace/target/cargo-build.log 2>&1
+              SB_LOG_LEVEL=debug scripts/bwrap_smoke.sh
             '

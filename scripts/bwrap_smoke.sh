@@ -19,6 +19,7 @@ ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/target/smoke-$ARCH}"
 TRACE_BACKEND="${SB_TRACE_BACKEND:-combined}"
 LOG_FILE="${SB_LOG:-$OUT/smoke.log}"
+LOG_LEVEL="${SB_LOG_LEVEL:-info}"
 mkdir -p "$OUT"
 if [[ "${SB_QUIET:-0}" != "0" ]]; then
   mkdir -p "$(dirname "$LOG_FILE")"
@@ -119,7 +120,7 @@ if [[ -n "$node_bin" ]]; then
   node_copy=()
   [[ -d "$node_share" ]] && node_copy+=(--copy-dir "$node_share")
   echo "node trace_backend=$TRACE_BACKEND"
-  run_bundle "bundle node" "$cli" create \
+  run_bundle "bundle node" "$cli" --log-level "$LOG_LEVEL" create \
     --from-host "$node_bin" \
     --name node \
     --out-dir "$OUT" \
@@ -141,7 +142,7 @@ print(sysconfig.get_paths()['stdlib'])
 PY
 )}"
   echo "python trace_backend=$TRACE_BACKEND"
-  run_bundle "bundle python" "$cli" create \
+  run_bundle "bundle python" "$cli" --log-level "$LOG_LEVEL" create \
     --from-host "$py_bin::trace=-c 'import encodings;import sys;sys.exit(0)'" \
     --name python3 \
     --out-dir "$OUT" \
@@ -183,7 +184,7 @@ if [[ -n "$java_bin" ]]; then
   java_ld_path="${java_home}/lib/jli:${java_home}/lib/server:${LD_LIBRARY_PATH:-}"
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
   echo "java trace_backend=$TRACE_BACKEND"
-  run_bundle "bundle java" env "LD_LIBRARY_PATH=${java_ld_path}" "$cli" create \
+  run_bundle "bundle java" env "LD_LIBRARY_PATH=${java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
     --from-host "$java_bin::trace=-version" \
     --name java \
     --out-dir "$OUT" \
