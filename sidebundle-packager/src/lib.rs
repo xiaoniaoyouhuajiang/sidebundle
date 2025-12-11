@@ -9,10 +9,11 @@ use std::path::{Component, Path, PathBuf};
 use log::{debug, info, warn};
 #[cfg(target_os = "linux")]
 use nix::libc;
+use path_clean::PathClean;
 use pathdiff::diff_paths;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sidebundle_core::{BundleSpec, DependencyClosure, ResolvedSymlink, TracedFile};
+use sidebundle_core::{BundleSpec, DependencyClosure, TracedFile};
 use thiserror::Error;
 
 mod launcher;
@@ -122,6 +123,7 @@ impl Packager {
             })
             .collect();
         let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
+        let mut seen_destinations: HashSet<PathBuf> = HashSet::new();
 
         for file in &closure.files {
             let mut source_path = file.source.clone();
@@ -160,23 +162,55 @@ impl Packager {
             }
             let stored = store_in_data(&data_dir, &source_path, &digest)?;
 
-            let dest_path = bundle_root.join(&file.destination);
-            let mut force_copy = script_targets.contains(&file.destination);
-            if is_system_resolv_or_hosts(&file.destination) {
+            let normalized_destination = normalize_payload_path(&file.destination);
+            if !seen_destinations.insert(normalized_destination.clone()) {
+                debug!(
+                    "packager: skipping duplicate destination {} (normalized from {})",
+                    normalized_destination.display(),
+                    file.destination.display()
+                );
+                let _ = alias_map.remove(&file.source);
+                continue;
+            }
+
+            let dest_path = bundle_root.join(&normalized_destination);
+            let mut force_copy = script_targets.contains(&normalized_destination);
+            if is_system_resolv_or_hosts(&normalized_destination) {
                 force_copy = true;
             }
-            link_or_copy(&stored, &dest_path, !force_copy)?;
+            match link_or_copy(&stored, &dest_path, !force_copy) {
+                Ok(()) => {}
+                Err(PackagerError::Io { path, source })
+                    if source.kind() == io::ErrorKind::TooManyLinks =>
+                {
+                    warn!(
+                        "packager: TooManyLinks at {}, forcing plain copy",
+                        path.display()
+                    );
+                    if path.exists() {
+                        let _ = fs::remove_file(&path);
+                    }
+                    fs::copy(&stored, &path).map_err(|source| PackagerError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    copy_permissions(&stored, &path).ok();
+                }
+                Err(e) => return Err(e),
+            }
             manifest_files.push(ManifestFile {
                 origin: FileOrigin::Dependency,
                 source: source_path.display().to_string(),
-                destination: file.destination.clone(),
+                destination: normalized_destination.clone(),
                 digest: digest.clone(),
             });
             if let Some(runtime_aliases) = alias_map.remove(&file.source) {
-                let canonical_abs = bundle_root.join(&file.destination);
+                let canonical_abs = bundle_root.join(&normalized_destination);
                 for runtime in runtime_aliases {
                     let alias_rel = payload_alias_destination(&runtime);
-                    if alias_rel == file.destination {
+                    let canonical_rel = clean_relative(&canonical_abs, &bundle_root);
+                    let alias_rel = normalize_payload_path(&alias_rel);
+                    if alias_rel == canonical_rel {
                         continue;
                     }
                     let alias_abs = bundle_root.join(&alias_rel);
@@ -191,17 +225,6 @@ impl Packager {
                             path: parent.to_path_buf(),
                             source,
                         })?;
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::symlink;
-                        if let Some(parent) = alias_abs.parent() {
-                            if let Some(relative) = diff_paths(&canonical_abs, parent) {
-                                if symlink(&relative, &alias_abs).is_ok() {
-                                    continue;
-                                }
-                            }
-                        }
                     }
                     fs::copy(&canonical_abs, &alias_abs).map_err(|source| PackagerError::Io {
                         path: alias_abs.clone(),
@@ -229,7 +252,11 @@ impl Packager {
         }
 
         for link in &closure.symlinks {
-            write_bundle_symlink(&bundle_root, link)?;
+            debug!(
+                "packager: ignoring symlink {} -> {} (symlink emission disabled)",
+                link.destination.display(),
+                link.bundle_target.display()
+            );
         }
 
         write_launchers(&bundle_root, &closure.entry_plans, &closure.metadata)?;
@@ -406,10 +433,29 @@ fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), P
             }
         }
     }
-    fs::copy(stored, dest).map_err(|source| PackagerError::Io {
-        path: dest.to_path_buf(),
-        source,
-    })?;
+    match fs::copy(stored, dest) {
+        Ok(_) => {}
+        Err(ref e) if e.kind() == io::ErrorKind::TooManyLinks => {
+            warn!(
+                "packager: TooManyLinks copying {} -> {}, falling back to plain copy",
+                stored.display(),
+                dest.display()
+            );
+            if dest.exists() {
+                let _ = fs::remove_file(dest);
+            }
+            fs::copy(stored, dest).map_err(|source| PackagerError::Io {
+                path: dest.to_path_buf(),
+                source,
+            })?;
+        }
+        Err(source) => {
+            return Err(PackagerError::Io {
+                path: dest.to_path_buf(),
+                source,
+            })
+        }
+    }
     copy_permissions(stored, dest).ok();
     Ok(())
 }
@@ -450,70 +496,6 @@ fn resolve_symlink(path: &Path) -> PathBuf {
     }
 }
 
-fn write_bundle_symlink(bundle_root: &Path, link: &ResolvedSymlink) -> Result<(), PackagerError> {
-    let dest_path = bundle_root.join(&link.destination);
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    if dest_path.exists() {
-        let meta = fs::symlink_metadata(&dest_path).map_err(|source| PackagerError::Io {
-            path: dest_path.clone(),
-            source,
-        })?;
-        if meta.is_dir() {
-            debug!(
-                "packager: skipping symlink {} because directory already exists",
-                dest_path.display()
-            );
-            return Ok(());
-        }
-        fs::remove_file(&dest_path).map_err(|source| PackagerError::Io {
-            path: dest_path.clone(),
-            source,
-        })?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        let relative_target = relative_symlink_target(bundle_root, &dest_path, &link.bundle_target);
-        symlink(&relative_target, &dest_path).map_err(|source| PackagerError::Io {
-            path: dest_path.clone(),
-            source,
-        })?;
-        debug!(
-            "packager: symlink {} -> {}",
-            dest_path.display(),
-            relative_target.display()
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        let source_abs = bundle_root.join(&link.bundle_target);
-        fs::copy(&source_abs, &dest_path).map_err(|source| PackagerError::Io {
-            path: dest_path.clone(),
-            source,
-        })?;
-        copy_permissions(&source_abs, &dest_path).ok();
-    }
-    Ok(())
-}
-
-fn relative_symlink_target(bundle_root: &Path, dest: &Path, bundle_target: &Path) -> PathBuf {
-    let target_abs = bundle_root.join(bundle_target);
-    if let Some(parent) = dest.parent() {
-        if let Some(relative) = diff_paths(&target_abs, parent) {
-            if relative.as_os_str().is_empty() {
-                return PathBuf::from(".");
-            }
-            return relative;
-        }
-    }
-    bundle_target.to_path_buf()
-}
-
 fn copy_permissions(src: &Path, dest: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -523,6 +505,14 @@ fn copy_permissions(src: &Path, dest: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn clean_relative(path: &Path, root: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).clean()
+}
+
+fn normalize_payload_path(path: &Path) -> PathBuf {
+    path.clean()
 }
 
 fn is_empty_resolv_conf(source: &Path, destination: &Path) -> bool {

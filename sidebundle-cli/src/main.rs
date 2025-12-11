@@ -826,9 +826,8 @@ fn copy_dir_into_closure(
 
     for dirent in WalkDir::new(source).follow_links(false).into_iter() {
         let dirent = dirent.with_context(|| format!("failed to walk {}", source.display()))?;
-        let meta = dirent
-            .metadata()
-            .with_context(|| format!("failed to stat {}", dirent.path().display()))?;
+        let meta = fs::symlink_metadata(dirent.path())
+            .with_context(|| format!("failed to lstat {}", dirent.path().display()))?;
         if meta.is_dir() {
             continue;
         }
@@ -856,13 +855,17 @@ fn copy_dir_into_closure(
             let target = fs::read_link(dirent.path()).with_context(|| {
                 format!("failed to read symlink target {}", dirent.path().display())
             })?;
-            let mut bundle_target = if target.is_absolute() {
-                payload_path_for(&target)
-            } else if let Some(parent) = dest.parent() {
+            // Resolve relative targets using the host path to avoid creating self-referential
+            // links when directories inside the bundle are also symlinks.
+            let host_target = if target.is_absolute() {
+                target
+            } else if let Some(parent) = dirent.path().parent() {
                 parent.join(&target)
             } else {
-                PathBuf::from("payload").join(&target)
+                target
             };
+            let host_target_norm = normalize_rel_path(&host_target);
+            let mut bundle_target = payload_path_for(&host_target_norm);
             let normalized_dest = normalize_rel_path(&dest);
             let normalized_target = normalize_rel_path(&bundle_target);
             let creates_cycle =
