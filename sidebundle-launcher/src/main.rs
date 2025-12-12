@@ -230,6 +230,11 @@ fn build_env_block(
         }
     }
 
+    if run_mode == RunMode::Host {
+        remap_host_env_path(bundle_root, &mut env_map, "PYTHONHOME");
+        remap_host_env_path_list(bundle_root, &mut env_map, "PYTHONPATH");
+    }
+
     let mut mapped_path_entries: Vec<String> = Vec::new();
     if run_mode == RunMode::Host {
         if let Some(path) = env_map.get("PATH").cloned() {
@@ -317,6 +322,52 @@ fn remap_path_entries(bundle_root: &Path, mode: RunMode, path: &str) -> Vec<Stri
                 .into_owned()
         })
         .collect()
+}
+
+fn remap_host_env_path(bundle_root: &Path, env_map: &mut BTreeMap<String, String>, key: &str) {
+    let Some(value) = env_map.get(key).cloned() else {
+        return;
+    };
+    if !value.starts_with('/') {
+        return;
+    }
+    let path = PathBuf::from(&value);
+    let payload_prefix = bundle_root.join("payload");
+    if path.starts_with(&payload_prefix) || path.starts_with(bundle_root) {
+        return;
+    }
+    let mut mapped = payload_prefix;
+    mapped.push(value.trim_start_matches('/'));
+    env_map.insert(key.to_string(), mapped.to_string_lossy().into_owned());
+}
+
+fn remap_host_env_path_list(bundle_root: &Path, env_map: &mut BTreeMap<String, String>, key: &str) {
+    let Some(value) = env_map.get(key).cloned() else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    let payload_prefix = bundle_root.join("payload");
+    let remapped: Vec<String> = value
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(|entry| {
+            if !entry.starts_with('/') {
+                return entry.to_string();
+            }
+            let p = PathBuf::from(entry);
+            if p.starts_with(&payload_prefix) || p.starts_with(bundle_root) {
+                return entry.to_string();
+            }
+            let mut mapped = payload_prefix.clone();
+            mapped.push(entry.trim_start_matches('/'));
+            mapped.to_string_lossy().into_owned()
+        })
+        .collect();
+    if !remapped.is_empty() {
+        env_map.insert(key.to_string(), remapped.join(":"));
+    }
 }
 
 fn dedup_strings(values: &mut Vec<String>) {

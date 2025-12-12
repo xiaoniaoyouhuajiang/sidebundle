@@ -119,7 +119,17 @@ import sysconfig
 print(sysconfig.get_paths().get("stdlib",""))
 PY
     )"
-    [[ -n "$py_stdlib" && -d "$py_stdlib" ]] && lldb_copy+=(--copy-dir "$py_stdlib")
+    # Avoid copying non-system stdlib trees (e.g. pyenv/conda in $HOME), which can explode bundle size.
+    if [[ -n "$py_stdlib" && -d "$py_stdlib" ]]; then
+      case "$py_stdlib" in
+        /usr/lib/*|/usr/local/lib/*)
+          lldb_copy+=(--copy-dir "$py_stdlib")
+          ;;
+        *)
+          echo "note: detected python stdlib at $py_stdlib (non-system); skipping copy-dir for lldb"
+          ;;
+      esac
+    fi
   fi
   run_bundle "bundle lldb" "$cli" --log-level "$LOG_LEVEL" create \
     --from-host "/usr/bin/lldb" \
@@ -127,6 +137,7 @@ PY
     --out-dir "$OUT" \
     --run-mode host \
     --trace-backend "$TRACE_BACKEND" \
+    --set-env "PYTHONHOME=/usr" \
     "${lldb_copy[@]}"
   run_bundle "run lldb" "$OUT/lldb/bin/lldb" --version
 else
