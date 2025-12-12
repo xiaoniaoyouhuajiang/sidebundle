@@ -94,7 +94,7 @@ jobs:
               try_run "$OUT_DIR/curl/bin/curl" --version
               try_run "$OUT_DIR/ffmpeg/bin/ffmpeg" -version
               try_run "$OUT_DIR/lldb/bin/lldb" --version
-              try_run "$OUT_DIR/node/bin/node" -e "console.log('verify-node')"
+              try_run "$OUT_DIR/node/bin/node" -e "console.log(\"verify-node\")"
               try_run "$OUT_DIR/tar/bin/tar" --version
               try_run "$OUT_DIR/pip3/bin/pip3" --version
               try_run "$OUT_DIR/npm/bin/npm" --version
