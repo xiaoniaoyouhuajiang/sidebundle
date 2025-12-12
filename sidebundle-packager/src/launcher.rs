@@ -227,8 +227,7 @@ mod tests {
     fn existing_node_path_is_preserved() {
         let plan = script_plan_with_interpreter("/usr/bin/node");
         let mut meta = RuntimeMetadata::default();
-        meta.env
-            .insert("NODE_PATH".into(), "/custom/nodejs".into());
+        meta.env.insert("NODE_PATH".into(), "/custom/nodejs".into());
         let meta = inject_script_metadata(&plan, Some(meta)).unwrap();
         assert_eq!(
             meta.env.get("NODE_PATH").map(String::as_str),

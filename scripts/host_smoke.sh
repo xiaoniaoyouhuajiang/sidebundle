@@ -94,7 +94,20 @@ bundle_and_run_elf() {
 # ELF candidates: prioritize basic + heavier deps (curl, node, ffmpeg, lldb, tar).
 bundle_and_run_elf "/bin/ls" "ls" "--version"
 bundle_and_run_elf "/usr/bin/curl" "curl" "--version"
-bundle_and_run_elf "/usr/bin/ffmpeg" "ffmpeg" "-version"
+# ffmpeg may depend on GPU/graphics driver libs (e.g. libdrm) that are filtered by default.
+# Allow them in this smoke bundle to ensure the artifact runs on a clean target machine.
+if [[ -x "/usr/bin/ffmpeg" ]]; then
+  run_bundle "bundle ffmpeg" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "/usr/bin/ffmpeg" \
+    --name "ffmpeg" \
+    --out-dir "$OUT" \
+    --run-mode host \
+    --trace-backend "$TRACE_BACKEND" \
+    --allow-gpu-libs
+  run_bundle "run ffmpeg" "$OUT/ffmpeg/bin/ffmpeg" -version
+else
+  echo "skip ffmpeg: /usr/bin/ffmpeg not found/executable"
+fi
 bundle_and_run_elf "/usr/bin/lldb" "lldb" "--version"
 bundle_and_run_elf "/usr/bin/node" "node" "-e" "console.log('host-smoke-node')"
 bundle_and_run_elf "/bin/tar" "tar" "--version"

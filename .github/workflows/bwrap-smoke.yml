@@ -3,8 +3,9 @@ name: smoke-tests
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: [main]
+    tags:
+      - "v*"
   pull_request:
     branches:
       - "**"
