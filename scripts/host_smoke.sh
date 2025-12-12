@@ -108,7 +108,30 @@ if [[ -x "/usr/bin/ffmpeg" ]]; then
 else
   echo "skip ffmpeg: /usr/bin/ffmpeg not found/executable"
 fi
-bundle_and_run_elf "/usr/bin/lldb" "lldb" "--version"
+
+# lldb embeds Python; include the host stdlib so filesystem encodings load on target machines.
+if [[ -x "/usr/bin/lldb" ]]; then
+  lldb_copy=()
+  if command -v python3 >/dev/null 2>&1; then
+    py_stdlib="$(
+      python3 - <<'PY'
+import sysconfig
+print(sysconfig.get_paths().get("stdlib",""))
+PY
+    )"
+    [[ -n "$py_stdlib" && -d "$py_stdlib" ]] && lldb_copy+=(--copy-dir "$py_stdlib")
+  fi
+  run_bundle "bundle lldb" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "/usr/bin/lldb" \
+    --name "lldb" \
+    --out-dir "$OUT" \
+    --run-mode host \
+    --trace-backend "$TRACE_BACKEND" \
+    "${lldb_copy[@]}"
+  run_bundle "run lldb" "$OUT/lldb/bin/lldb" --version
+else
+  echo "skip lldb: /usr/bin/lldb not found/executable"
+fi
 bundle_and_run_elf "/usr/bin/node" "node" "-e" "console.log('host-smoke-node')"
 bundle_and_run_elf "/bin/tar" "tar" "--version"
 
