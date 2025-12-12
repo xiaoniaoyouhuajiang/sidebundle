@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Host-mode smoke tests: package common ELF and shebang tools on system A,
+# then run them directly (simulating system B with same arch). This script
+# uses sidebundle-cli in --run-mode host.
+#
+# Env overrides:
+#   SB_CLI       path to sidebundle-cli (default: auto-detect/build)
+#   OUT          output dir (default: target/host-smoke-$(uname -m))
+#   SB_LOG_LEVEL sidebundle-cli log level (default: info)
+#   SB_QUIET     if set to 1, capture logs to $OUT/host-smoke.log
+#   SB_DEBUG     if set to 1, enables bash tracing
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ARCH="$(uname -m)"
+OUT="${OUT:-$ROOT/target/host-smoke-$ARCH}"
+LOG_FILE="${SB_LOG:-$OUT/host-smoke.log}"
+LOG_LEVEL="${SB_LOG_LEVEL:-info}"
+TRACE_BACKEND="${SB_TRACE_BACKEND:-auto}"
+
+mkdir -p "$OUT"
+if [[ "${SB_QUIET:-0}" != "0" ]]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : >"$LOG_FILE"
+fi
+
+if [[ "${SB_DEBUG:-0}" != "0" ]]; then
+  set -x
+fi
+
+if [[ "${SB_QUIET:-0}" != "0" ]]; then
+  trap 'status=$?; if [[ $status -ne 0 ]]; then echo "host smoke failed (exit $status), showing last 200 lines from $LOG_FILE"; tail -n 200 "$LOG_FILE" || true; fi' EXIT
+fi
+
+ensure_cli() {
+  if [[ -n "${SB_CLI:-}" ]]; then
+    echo "$SB_CLI"
+    return
+  fi
+  local candidates=(
+    "$ROOT/target/${ARCH}-unknown-linux-musl/release/sidebundle-cli"
+    "$ROOT/target/release/sidebundle-cli"
+  )
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return
+    fi
+  done
+  echo "building sidebundle-cli..."
+  cargo build --release -p sidebundle-cli
+  echo "$ROOT/target/release/sidebundle-cli"
+}
+
+run_bundle() {
+  local name="$1"; shift
+  local cmd=("$@")
+  if [[ "${SB_QUIET:-0}" != "0" ]]; then
+    echo "==> $name (quiet; logs -> $LOG_FILE)"
+    {
+      echo "===== $name ====="
+      echo "\$ ${cmd[*]}"
+      "${cmd[@]}"
+      echo "===== end $name ====="
+    } >>"$LOG_FILE" 2>&1
+  else
+    echo "==> $name: ${cmd[*]}"
+    "${cmd[@]}"
+  fi
+}
+
+cli="$(ensure_cli)"
+
+# Common helper to bundle an ELF and run a simple command.
+bundle_and_run_elf() {
+  local bin="$1" name="$2"
+  shift 2
+  local args=("$@")
+  if [[ ! -x "$bin" ]]; then
+    echo "skip $name: $bin not found/executable"
+    return
+  fi
+  local out="$OUT/$name"
+  run_bundle "bundle $name" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "$bin" \
+    --name "$name" \
+    --out-dir "$OUT" \
+    --run-mode host \
+    --trace-backend "$TRACE_BACKEND"
+  run_bundle "run $name" "$out/bin/$name" "${args[@]}"
+}
+
+# ELF candidates: prioritize basic + heavier deps (curl, node, ffmpeg, lldb, tar).
+bundle_and_run_elf "/bin/ls" "ls" 0 "--version"
+bundle_and_run_elf "/usr/bin/curl" "curl" 0 "--version"
+bundle_and_run_elf "/usr/bin/ffmpeg" "ffmpeg" 0 "-version"
+bundle_and_run_elf "/usr/bin/lldb" "lldb" 0 "--version"
+bundle_and_run_elf "/usr/bin/node" "node" 0 "-e" "console.log('host-smoke-node')"
+bundle_and_run_elf "/bin/tar" "tar" 0 "--version"
+
+# Shebang: pip3
+if command -v pip3 >/dev/null 2>&1; then
+  run_bundle "bundle pip3" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "/usr/bin/pip3::trace=--version" \
+    --name pip3 \
+    --out-dir "$OUT" \
+    --run-mode host \
+    --trace-backend "$TRACE_BACKEND"
+  run_bundle "run pip3" "$OUT/pip3/bin/pip3" --version
+else
+  echo "pip3 not found; skipping pip3 shebang test"
+fi
+
+# Shebang: npm
+if command -v npm >/dev/null 2>&1; then
+  run_bundle "bundle npm" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "/usr/bin/npm::trace=--version" \
+    --name npm \
+    --out-dir "$OUT" \
+    --run-mode host \
+    --trace-backend "$TRACE_BACKEND"
+  run_bundle "run npm" "$OUT/npm/bin/npm" --version
+else
+  echo "npm not found; skipping npm shebang test"
+fi
+
+# Shebang: custom bash script
+hello_script="$OUT/hello.sh"
+cat >"$hello_script" <<'EOF'
+#!/usr/bin/env bash
+echo "host-shebang-hello"
+EOF
+chmod +x "$hello_script"
+run_bundle "bundle hello.sh" "$cli" --log-level "$LOG_LEVEL" create \
+  --from-host "$hello_script" \
+  --name hello-sh \
+  --out-dir "$OUT" \
+  --run-mode host \
+  --trace-backend "$TRACE_BACKEND"
+run_bundle "run hello.sh" "$OUT/hello-sh/bin/hello.sh"
+
+echo "host smoke completed (OUT=$OUT)"
