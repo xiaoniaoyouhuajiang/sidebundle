@@ -92,12 +92,12 @@ bundle_and_run_elf() {
 }
 
 # ELF candidates: prioritize basic + heavier deps (curl, node, ffmpeg, lldb, tar).
-bundle_and_run_elf "/bin/ls" "ls" 0 "--version"
-bundle_and_run_elf "/usr/bin/curl" "curl" 0 "--version"
-bundle_and_run_elf "/usr/bin/ffmpeg" "ffmpeg" 0 "-version"
-bundle_and_run_elf "/usr/bin/lldb" "lldb" 0 "--version"
-bundle_and_run_elf "/usr/bin/node" "node" 0 "-e" "console.log('host-smoke-node')"
-bundle_and_run_elf "/bin/tar" "tar" 0 "--version"
+bundle_and_run_elf "/bin/ls" "ls" "--version"
+bundle_and_run_elf "/usr/bin/curl" "curl" "--version"
+bundle_and_run_elf "/usr/bin/ffmpeg" "ffmpeg" "-version"
+bundle_and_run_elf "/usr/bin/lldb" "lldb" "--version"
+bundle_and_run_elf "/usr/bin/node" "node" "-e" "console.log('host-smoke-node')"
+bundle_and_run_elf "/bin/tar" "tar" "--version"
 
 # Shebang: pip3
 if command -v pip3 >/dev/null 2>&1; then
@@ -114,12 +114,18 @@ fi
 
 # Shebang: npm
 if command -v npm >/dev/null 2>&1; then
+  npm_copy=()
+  # We use copy-dir here to make npm's global JS dependencies (e.g. semver) available in host-mode
+  # smoke runs. On systems where fanotify tracing is reliably enabled for host-mode, a sufficiently
+  # heavy trace load could also discover and include these files without copy-dir.
+  [[ -d /usr/share/nodejs ]] && npm_copy+=(--copy-dir /usr/share/nodejs)
   run_bundle "bundle npm" "$cli" --log-level "$LOG_LEVEL" create \
     --from-host "/usr/bin/npm::trace=--version" \
     --name npm \
     --out-dir "$OUT" \
     --run-mode host \
-    --trace-backend "$TRACE_BACKEND"
+    --trace-backend auto \
+    "${npm_copy[@]}"
   run_bundle "run npm" "$OUT/npm/bin/npm" --version
 else
   echo "npm not found; skipping npm shebang test"

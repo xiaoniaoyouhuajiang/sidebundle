@@ -164,6 +164,12 @@ fn inject_script_metadata(
         return metadata;
     }
     let mut metadata = metadata.unwrap_or_default();
+    // Debian/Ubuntu package many global JS deps under /usr/share/nodejs. When bundling shebang
+    // scripts (e.g. npm), ensure Node can resolve those modules inside the bundle.
+    metadata
+        .env
+        .entry("NODE_PATH".into())
+        .or_insert_with(|| "/usr/share/nodejs".to_string());
     let opts = metadata.env.entry("NODE_OPTIONS".into()).or_default();
     const FLAGS: &[&str] = &["--preserve-symlinks-main", "--preserve-symlinks"];
     for flag in FLAGS {
@@ -182,4 +188,57 @@ fn is_node_interpreter(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .map(|name| matches!(name, "node" | "nodejs"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sidebundle_core::ScriptEntryPlan;
+    use std::path::PathBuf;
+
+    fn script_plan_with_interpreter(interpreter: &str) -> ScriptEntryPlan {
+        ScriptEntryPlan {
+            display_name: "demo".into(),
+            script_source: PathBuf::from("/bin/demo"),
+            script_destination: PathBuf::from("payload/bin/demo"),
+            interpreter_source: PathBuf::from(interpreter),
+            interpreter_destination: PathBuf::from(interpreter),
+            linker_source: PathBuf::new(),
+            linker_destination: PathBuf::new(),
+            interpreter_args: Vec::new(),
+            library_dirs: Vec::new(),
+            requires_linker: false,
+            origin: sidebundle_core::Origin::Host,
+            run_mode: None,
+        }
+    }
+
+    #[test]
+    fn node_scripts_get_node_path_default() {
+        let plan = script_plan_with_interpreter("/usr/bin/node");
+        let meta = inject_script_metadata(&plan, None).unwrap();
+        assert_eq!(
+            meta.env.get("NODE_PATH").map(String::as_str),
+            Some("/usr/share/nodejs")
+        );
+    }
+
+    #[test]
+    fn existing_node_path_is_preserved() {
+        let plan = script_plan_with_interpreter("/usr/bin/node");
+        let mut meta = RuntimeMetadata::default();
+        meta.env
+            .insert("NODE_PATH".into(), "/custom/nodejs".into());
+        let meta = inject_script_metadata(&plan, Some(meta)).unwrap();
+        assert_eq!(
+            meta.env.get("NODE_PATH").map(String::as_str),
+            Some("/custom/nodejs")
+        );
+    }
+
+    #[test]
+    fn non_node_scripts_untouched() {
+        let plan = script_plan_with_interpreter("/usr/bin/python3");
+        assert!(inject_script_metadata(&plan, None).is_none());
+    }
 }

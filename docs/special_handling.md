@@ -12,6 +12,7 @@
 ## Node shebang 保持符号链接
 - 目的：node 解析 shebang 时若跟随符号链接，部分脚本会出问题。
 - 处理：为 node 解释器注入 `NODE_OPTIONS=--preserve-symlinks-main --preserve-symlinks`。（`sidebundle-packager/src/launcher.rs:inject_script_metadata`）
+  - 额外：对 node shebang 脚本注入 `NODE_PATH=/usr/share/nodejs`，以兼容 Debian/Ubuntu 的全局 JS 模块布局（如 npm 运行时依赖 semver 等）。
 
 ## PATH/LD_LIBRARY_PATH 映射与 JVM 兼容
 - 目的：Host 模式下把打包路径放到前面，避免回落宿主；JVM/dlopen 常需要兄弟 lib 目录。
