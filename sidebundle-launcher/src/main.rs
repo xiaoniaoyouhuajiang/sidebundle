@@ -408,50 +408,6 @@ fn map_bundle_path(bundle_root: &Path, rel: &Path, mode: RunMode) -> PathBuf {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{EnvRemapper, RunMode};
-    use std::collections::BTreeMap;
-    use std::path::Path;
-
-    #[test]
-    fn remap_abs_into_payload_is_idempotent() {
-        let bundle_root = Path::new("/tmp/bundle");
-        let remapper = EnvRemapper::new(bundle_root);
-        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
-
-        env_map.insert("JAVA_HOME".into(), "/usr/lib/jvm/java".into());
-        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
-        assert_eq!(
-            env_map.get("JAVA_HOME").unwrap(),
-            "/tmp/bundle/payload/usr/lib/jvm/java"
-        );
-
-        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
-        assert_eq!(
-            env_map.get("JAVA_HOME").unwrap(),
-            "/tmp/bundle/payload/usr/lib/jvm/java"
-        );
-    }
-
-    #[test]
-    fn remap_abs_list_into_payload_keeps_relative_entries() {
-        let bundle_root = Path::new("/tmp/bundle");
-        let remapper = EnvRemapper::new(bundle_root);
-        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
-        env_map.insert("PYTHONPATH".into(), "rel:/usr/lib/python3.10:/x".into());
-
-        // Mimic host-only behavior at call site; the method itself does not check RunMode.
-        let _mode = RunMode::Host;
-        remapper.remap_abs_list_into_payload(&mut env_map, "PYTHONPATH");
-
-        assert_eq!(
-            env_map.get("PYTHONPATH").unwrap(),
-            "rel:/tmp/bundle/payload/usr/lib/python3.10:/tmp/bundle/payload/x"
-        );
-    }
-}
-
 fn ensure_payload_data(bundle_root: &Path, payload_root: &Path) -> Result<()> {
     if let Err(err) = isolate_mount_namespace() {
         eprintln!("sidebundle launcher: warning: failed to isolate mount namespace ({err})");
@@ -730,4 +686,48 @@ fn exec_chroot(
     // Once chrooted, the PT_INTERP inside the payload points to bundled ld-linux; exec the entry
     // directly so /proc/self/exe matches the intended binary (important for multi-call binaries).
     exec_static(entry, argv, envp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvRemapper, RunMode};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn remap_abs_into_payload_is_idempotent() {
+        let bundle_root = Path::new("/tmp/bundle");
+        let remapper = EnvRemapper::new(bundle_root);
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+
+        env_map.insert("JAVA_HOME".into(), "/usr/lib/jvm/java".into());
+        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
+        assert_eq!(
+            env_map.get("JAVA_HOME").unwrap(),
+            "/tmp/bundle/payload/usr/lib/jvm/java"
+        );
+
+        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
+        assert_eq!(
+            env_map.get("JAVA_HOME").unwrap(),
+            "/tmp/bundle/payload/usr/lib/jvm/java"
+        );
+    }
+
+    #[test]
+    fn remap_abs_list_into_payload_keeps_relative_entries() {
+        let bundle_root = Path::new("/tmp/bundle");
+        let remapper = EnvRemapper::new(bundle_root);
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        env_map.insert("PYTHONPATH".into(), "rel:/usr/lib/python3.10:/x".into());
+
+        // Mimic host-only behavior at call site; the method itself does not check RunMode.
+        let _mode = RunMode::Host;
+        remapper.remap_abs_list_into_payload(&mut env_map, "PYTHONPATH");
+
+        assert_eq!(
+            env_map.get("PYTHONPATH").unwrap(),
+            "rel:/tmp/bundle/payload/usr/lib/python3.10:/tmp/bundle/payload/x"
+        );
+    }
 }
