@@ -2,11 +2,15 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use sidebundle_shim::{ShimMetadata, ShimTrailer};
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use tar::Builder;
+use tar::{Builder, EntryType, Header};
 use walkdir::WalkDir;
 
 use crate::PackagerError;
@@ -67,6 +71,8 @@ fn build_archive(bundle_root: &Path) -> Result<(Vec<u8>, String), PackagerError>
     {
         let mut builder = Builder::new(&mut encoder);
         builder.follow_symlinks(false);
+        #[cfg(unix)]
+        let mut hardlinks: HashMap<(u64, u64), std::path::PathBuf> = HashMap::new();
         for entry in WalkDir::new(bundle_root).follow_links(false) {
             let entry = entry.map_err(|err| PackagerError::Shim(err.to_string()))?;
             let path = entry.path();
@@ -79,12 +85,35 @@ fn build_archive(bundle_root: &Path) -> Result<(Vec<u8>, String), PackagerError>
             if rel.starts_with("shims") {
                 continue;
             }
+            let ftype = entry.file_type();
             let meta = entry
                 .metadata()
                 .map_err(|err| PackagerError::Shim(err.to_string()))?;
-            if meta.is_dir() {
+            if ftype.is_dir() {
                 builder
                     .append_dir(rel, path)
+                    .map_err(|err| PackagerError::Shim(err.to_string()))?;
+            } else if ftype.is_file() {
+                #[cfg(unix)]
+                {
+                    let key = (meta.dev(), meta.ino());
+                    if let Some(first) = hardlinks.get(&key) {
+                        let mut header = Header::new_gnu();
+                        header.set_entry_type(EntryType::Link);
+                        header.set_size(0);
+                        header.set_mode(meta.mode());
+                        header.set_uid(meta.uid().into());
+                        header.set_gid(meta.gid().into());
+                        header.set_mtime(u64::try_from(meta.mtime()).unwrap_or(0));
+                        builder
+                            .append_link(&mut header, rel, first)
+                            .map_err(|err| PackagerError::Shim(err.to_string()))?;
+                        continue;
+                    }
+                    hardlinks.insert(key, rel.to_path_buf());
+                }
+                builder
+                    .append_path_with_name(path, rel)
                     .map_err(|err| PackagerError::Shim(err.to_string()))?;
             } else {
                 builder
@@ -128,4 +157,50 @@ fn set_exec_permissions(path: &Path) -> Result<(), PackagerError> {
         source,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_archive;
+    use flate2::read::GzDecoder;
+    use std::fs;
+    use std::io::Read;
+    use tar::{Archive, EntryType};
+    use tempfile::tempdir;
+
+    #[test]
+    fn archive_preserves_hardlinks_as_tar_links() {
+        let dir = tempdir().unwrap();
+        let bundle_root = dir.path().join("bundle");
+        fs::create_dir_all(bundle_root.join("payload")).unwrap();
+
+        let a = bundle_root.join("payload/a.txt");
+        let b = bundle_root.join("payload/b.txt");
+        fs::write(&a, b"hello").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+
+        let (archive_bytes, _digest) = build_archive(&bundle_root).unwrap();
+        let mut decoder = GzDecoder::new(&archive_bytes[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+
+        let mut ar = Archive::new(&decompressed[..]);
+        let mut file_entries = 0;
+        let mut link_entries = 0;
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().to_path_buf();
+            if path == std::path::Path::new("payload/a.txt")
+                || path == std::path::Path::new("payload/b.txt")
+            {
+                match entry.header().entry_type() {
+                    EntryType::Regular => file_entries += 1,
+                    EntryType::Link => link_entries += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(file_entries, 1);
+        assert_eq!(link_entries, 1);
+    }
 }

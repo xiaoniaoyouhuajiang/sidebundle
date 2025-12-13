@@ -127,6 +127,8 @@ impl Packager {
         let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
         let mut seen_destinations: HashSet<PathBuf> = HashSet::new();
         let mut alias_file_count: u64 = 0;
+        let mut alias_hardlink_count: u64 = 0;
+        let mut alias_copy_count: u64 = 0;
         let mut alias_logical_bytes: u64 = 0;
         let mut alias_allocated_bytes: u64 = 0;
 
@@ -231,17 +233,29 @@ impl Packager {
                             source,
                         })?;
                     }
-                    fs::copy(&canonical_abs, &alias_abs).map_err(|source| PackagerError::Io {
-                        path: alias_abs.clone(),
-                        source,
-                    })?;
-                    copy_permissions(&canonical_abs, &alias_abs).ok();
+                    let mut used_hardlink = false;
+                    if fs::hard_link(&canonical_abs, &alias_abs).is_ok() {
+                        used_hardlink = true;
+                        alias_hardlink_count = alias_hardlink_count.saturating_add(1);
+                    } else {
+                        fs::copy(&canonical_abs, &alias_abs).map_err(|source| PackagerError::Io {
+                            path: alias_abs.clone(),
+                            source,
+                        })?;
+                        copy_permissions(&canonical_abs, &alias_abs).ok();
+                        alias_copy_count = alias_copy_count.saturating_add(1);
+                    }
                     alias_file_count = alias_file_count.saturating_add(1);
                     match fs::metadata(&alias_abs) {
                         Ok(meta) => {
                             alias_logical_bytes = alias_logical_bytes.saturating_add(meta.len());
-                            alias_allocated_bytes =
-                                alias_allocated_bytes.saturating_add(allocated_bytes(&meta));
+                            // If this alias is a hardlink, it does not contribute additional data
+                            // blocks relative to the canonical path. Only count allocations for
+                            // aliases materialized via copy.
+                            if !used_hardlink {
+                                alias_allocated_bytes =
+                                    alias_allocated_bytes.saturating_add(allocated_bytes(&meta));
+                            }
                         }
                         Err(_) => {
                             warn!(
@@ -260,8 +274,12 @@ impl Packager {
         }
 
         info!(
-            "packager: alias files: {} (logical={} bytes, allocated={} bytes)",
-            alias_file_count, alias_logical_bytes, alias_allocated_bytes
+            "packager: alias files: {} (hardlinks={}, copies={}, logical={} bytes, allocated={} bytes)",
+            alias_file_count,
+            alias_hardlink_count,
+            alias_copy_count,
+            alias_logical_bytes,
+            alias_allocated_bytes
         );
 
         for (missing_source, aliases) in alias_map {
