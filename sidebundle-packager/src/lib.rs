@@ -4,6 +4,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use log::{debug, info, warn};
@@ -124,6 +126,9 @@ impl Packager {
             .collect();
         let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
         let mut seen_destinations: HashSet<PathBuf> = HashSet::new();
+        let mut alias_file_count: u64 = 0;
+        let mut alias_logical_bytes: u64 = 0;
+        let mut alias_allocated_bytes: u64 = 0;
 
         for file in &closure.files {
             let mut source_path = file.source.clone();
@@ -231,6 +236,20 @@ impl Packager {
                         source,
                     })?;
                     copy_permissions(&canonical_abs, &alias_abs).ok();
+                    alias_file_count = alias_file_count.saturating_add(1);
+                    match fs::metadata(&alias_abs) {
+                        Ok(meta) => {
+                            alias_logical_bytes = alias_logical_bytes.saturating_add(meta.len());
+                            alias_allocated_bytes =
+                                alias_allocated_bytes.saturating_add(allocated_bytes(&meta));
+                        }
+                        Err(_) => {
+                            warn!(
+                                "packager: failed to stat alias destination {}",
+                                alias_abs.display()
+                            );
+                        }
+                    }
                     debug!(
                         "packager: aliasing {} -> {}",
                         canonical_abs.display(),
@@ -239,6 +258,11 @@ impl Packager {
                 }
             }
         }
+
+        info!(
+            "packager: alias files: {} (logical={} bytes, allocated={} bytes)",
+            alias_file_count, alias_logical_bytes, alias_allocated_bytes
+        );
 
         for (missing_source, aliases) in alias_map {
             warn!(
@@ -505,6 +529,17 @@ fn copy_permissions(src: &Path, dest: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn allocated_bytes(meta: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 fn clean_relative(path: &Path, root: &Path) -> PathBuf {
