@@ -125,6 +125,10 @@ gh_group_end() {
 
 dump_npm_debug() {
   local npm_out="$1"
+  local module_dirs=(
+    "$npm_out/payload/usr/share/nodejs/@npmcli/node_modules/walk-up-path"
+    "$npm_out/payload/usr/share/nodejs/npm/node_modules/walk-up-path"
+  )
   gh_group_start "debug npm bundle layout"
   echo "npm_out=$npm_out"
   echo "payload root: $npm_out/payload"
@@ -135,6 +139,25 @@ dump_npm_debug() {
   find "$npm_out/payload/usr/share/nodejs" -maxdepth 3 -name 'walk-up-path*' -print 2>/dev/null | head -n 200 || true
   echo "find semver under payload/usr/share/nodejs:"
   find "$npm_out/payload/usr/share/nodejs" -maxdepth 3 -name 'semver*' -print 2>/dev/null | head -n 200 || true
+  echo "inspect walk-up-path module dirs:"
+  for d in "${module_dirs[@]}"; do
+    echo "--- $d ---"
+    if [[ ! -e "$d" ]]; then
+      echo "missing: $d"
+      continue
+    fi
+    ls -la "$d" 2>/dev/null | head -n 200 || true
+    if [[ -f "$d/package.json" ]]; then
+      echo "package.json (first 80 lines):"
+      sed -n '1,80p' "$d/package.json" 2>/dev/null || true
+    else
+      echo "missing package.json at $d"
+    fi
+    echo "symlinks under $d (first 50):"
+    find "$d" -maxdepth 3 -type l -print 2>/dev/null | head -n 50 || true
+    echo "broken symlinks under $d (first 50):"
+    find "$d" -xtype l -print 2>/dev/null | head -n 50 || true
+  done
   echo "npm entry points:"
   for p in \
     "$npm_out/payload/usr/bin/npm" \
@@ -151,6 +174,8 @@ dump_npm_debug() {
   find "$npm_out/payload/usr/share/nodejs" -maxdepth 2 -type l -print 2>/dev/null | head -n 50 || true
   echo "broken symlinks under payload/usr/share/nodejs (first 50):"
   find "$npm_out/payload/usr/share/nodejs" -xtype l -print 2>/dev/null | head -n 50 || true
+  echo "node module resolution trace (NODE_DEBUG=module; first 200 lines):"
+  (env NODE_DEBUG=module "$npm_out/bin/npm" --version 2>&1 || true) | head -n 200
   gh_group_end
 }
 
