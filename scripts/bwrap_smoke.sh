@@ -106,6 +106,74 @@ run_bundle() {
   fi
 }
 
+gh_group_start() {
+  local title="$1"
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::group::$title"
+  else
+    echo "===== $title ====="
+  fi
+}
+
+gh_group_end() {
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::endgroup::"
+  else
+    echo "===== end ====="
+  fi
+}
+
+dump_npm_debug() {
+  local npm_out="$1"
+  gh_group_start "debug npm bundle layout"
+  echo "npm_out=$npm_out"
+  echo "payload root: $npm_out/payload"
+  echo "trace_backend=$TRACE_BACKEND"
+  echo "ls payload/usr/share/nodejs (top-level):"
+  ls -la "$npm_out/payload/usr/share/nodejs" 2>/dev/null | head -n 200 || true
+  echo "find walk-up-path under payload/usr/share/nodejs:"
+  find "$npm_out/payload/usr/share/nodejs" -maxdepth 3 -name 'walk-up-path*' -print 2>/dev/null | head -n 200 || true
+  echo "find semver under payload/usr/share/nodejs:"
+  find "$npm_out/payload/usr/share/nodejs" -maxdepth 3 -name 'semver*' -print 2>/dev/null | head -n 200 || true
+  echo "npm entry points:"
+  for p in \
+    "$npm_out/payload/usr/bin/npm" \
+    "$npm_out/payload/usr/bin/npm-cli.js" \
+    "$npm_out/payload/usr/share/nodejs/npm/bin/npm-cli.js" \
+    ; do
+    if [[ -e "$p" ]]; then
+      echo "- $p"
+      (ls -la "$p" && readlink "$p") 2>/dev/null || true
+      head -n 3 "$p" 2>/dev/null || true
+    fi
+  done
+  echo "symlinks under payload/usr/share/nodejs (first 50):"
+  find "$npm_out/payload/usr/share/nodejs" -maxdepth 2 -type l -print 2>/dev/null | head -n 50 || true
+  echo "broken symlinks under payload/usr/share/nodejs (first 50):"
+  find "$npm_out/payload/usr/share/nodejs" -xtype l -print 2>/dev/null | head -n 50 || true
+  gh_group_end
+}
+
+dump_pip3_debug() {
+  local pip3_out="$1"
+  gh_group_start "debug pip3 bundle layout"
+  echo "pip3_out=$pip3_out"
+  echo "payload root: $pip3_out/payload"
+  echo "trace_backend=$TRACE_BACKEND"
+  echo "find _pydecimal.py in payload:"
+  find "$pip3_out/payload" -maxdepth 5 -name '_pydecimal.py' -print 2>/dev/null | head -n 50 || true
+  echo "find _decimal*.so in payload:"
+  find "$pip3_out/payload" -maxdepth 7 -name '_decimal*.so' -print 2>/dev/null | head -n 50 || true
+  echo "find libmpdec.so* in payload:"
+  find "$pip3_out/payload" -maxdepth 7 -name 'libmpdec.so*' -print 2>/dev/null | head -n 50 || true
+  echo "pip3 entry point:"
+  if [[ -e "$pip3_out/payload/usr/bin/pip3" ]]; then
+    ls -la "$pip3_out/payload/usr/bin/pip3" 2>/dev/null || true
+    head -n 3 "$pip3_out/payload/usr/bin/pip3" 2>/dev/null || true
+  fi
+  gh_group_end
+}
+
 cli="$(ensure_cli)"
 ensure_bwrap
 arch_lib="$(arch_lib_dir)"
@@ -229,7 +297,10 @@ if [[ -n "$pip3_bin" ]]; then
     --out-dir "$OUT" \
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND"
-  run_bundle "run pip3" "$pip3_out/bin/pip3" --version
+  if ! run_bundle "run pip3" "$pip3_out/bin/pip3" --version; then
+    dump_pip3_debug "$pip3_out"
+    exit 1
+  fi
 else
   echo "pip3 not found; skipping pip3 test"
 fi
@@ -245,7 +316,10 @@ if [[ -n "$npm_bin" ]]; then
     --out-dir "$OUT" \
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND"
-  run_bundle "run npm" "$npm_out/bin/npm" --version
+  if ! run_bundle "run npm" "$npm_out/bin/npm" --version; then
+    dump_npm_debug "$npm_out"
+    exit 1
+  fi
 else
   echo "npm not found; skipping npm test"
 fi
