@@ -33,7 +33,7 @@ jobs:
               apt-get update -qq >>"$APT_LOG" 2>&1
               DEBIAN_FRONTEND=noninteractive apt-get install -yqq \
                 bubblewrap sudo curl build-essential \
-                nodejs python3 openjdk-17-jdk \
+                nodejs npm python3 python3-pip openjdk-17-jdk \
                 ca-certificates git pkg-config libssl-dev bash >>"$APT_LOG" 2>&1
               # Install Rust via rustup
               curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
@@ -42,6 +42,31 @@ jobs:
               echo "Building sidebundle-cli (logs: /github/workspace/target/cargo-build.log)"
               cargo build --release -p sidebundle-cli >/github/workspace/target/cargo-build.log 2>&1
               SB_TRACE_BACKEND=combined SB_LOG_LEVEL=debug scripts/bwrap_smoke.sh
+            '
+
+      - name: Verify bwrap bundles on different base image
+        uses: addnab/docker-run-action@v3
+        with:
+          image: debian:12-slim
+          options: --privileged --security-opt seccomp=unconfined -v ${{ github.workspace }}:/github/workspace
+          workdir: /github/workspace
+          run: |
+            bash -eo pipefail -c '
+              OUT_DIR=/github/workspace/target/smoke-$(uname -m)
+              echo "Verifying bwrap bundles from $OUT_DIR on debian:12-slim"
+              if [[ ! -d "$OUT_DIR" ]]; then
+                echo "bwrap-smoke output not found at $OUT_DIR"
+                exit 1
+              fi
+              APT_LOG=/github/workspace/target/apt-verify-bwrap.log
+              apt-get update -qq >>"$APT_LOG" 2>&1
+              DEBIAN_FRONTEND=noninteractive apt-get install -yqq bubblewrap >>"$APT_LOG" 2>&1
+              try_run() { local path="$1"; shift; if [[ -x "$path" ]]; then echo "-> $path $*"; "$path" "$@"; else echo "skip missing $path"; fi; }
+              try_run "$OUT_DIR/node/bin/node" -e "console.log(\"verify-node\")"
+              try_run "$OUT_DIR/python3/bin/python3" -c "import sys;print(\"verify-python\", sys.version.split()[0])"
+              try_run "$OUT_DIR/java/bin/java" -version
+              try_run "$OUT_DIR/pip3/bin/pip3" --version
+              try_run "$OUT_DIR/npm/bin/npm" --version
             '
 
   host-smoke:

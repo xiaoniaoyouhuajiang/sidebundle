@@ -217,3 +217,35 @@ EOF
 else
   echo "java not found; skipping java test"
 fi
+
+# pip3 (shebang + Python runtime resources)
+pip3_bin="${SB_PIP3_BIN:-$(command -v pip3 || true)}"
+if [[ -n "$pip3_bin" ]]; then
+  pip3_out="$OUT/pip3"
+  echo "pip3 trace_backend=$TRACE_BACKEND"
+  run_bundle "bundle pip3" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "$pip3_bin::trace=--version" \
+    --name pip3 \
+    --out-dir "$OUT" \
+    --run-mode bwrap \
+    --trace-backend "$TRACE_BACKEND"
+  run_bundle "run pip3" "$pip3_out/bin/pip3" --version
+else
+  echo "pip3 not found; skipping pip3 test"
+fi
+
+# npm (shebang + Node runtime resources)
+npm_bin="${SB_NPM_BIN:-$(command -v npm || true)}"
+if [[ -n "$npm_bin" ]]; then
+  npm_out="$OUT/npm"
+  echo "npm trace_backend=$TRACE_BACKEND"
+  run_bundle "bundle npm" "$cli" --log-level "$LOG_LEVEL" create \
+    --from-host "$npm_bin::trace=--version" \
+    --name npm \
+    --out-dir "$OUT" \
+    --run-mode bwrap \
+    --trace-backend "$TRACE_BACKEND"
+  run_bundle "run npm" "$npm_out/bin/npm" --version
+else
+  echo "npm not found; skipping npm test"
+fi
