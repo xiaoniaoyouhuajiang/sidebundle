@@ -153,7 +153,7 @@ if command -v pip3 >/dev/null 2>&1; then
     --name pip3 \
     --out-dir "$OUT" \
     --run-mode host \
-    --trace-backend "$TRACE_BACKEND"
+    --trace-backend combined
   run_bundle "run pip3" "$OUT/pip3/bin/pip3" --version
 else
   echo "pip3 not found; skipping pip3 shebang test"
