@@ -17,6 +17,64 @@ fn main() {
     }
 }
 
+struct EnvRemapper<'a> {
+    bundle_root: &'a Path,
+    payload_prefix: PathBuf,
+}
+
+impl<'a> EnvRemapper<'a> {
+    fn new(bundle_root: &'a Path) -> Self {
+        Self {
+            bundle_root,
+            payload_prefix: bundle_root.join("payload"),
+        }
+    }
+
+    fn remap_abs_into_payload(&self, env_map: &mut BTreeMap<String, String>, key: &str) {
+        let Some(value) = env_map.get(key).cloned() else {
+            return;
+        };
+        if !value.starts_with('/') {
+            return;
+        }
+        let path = PathBuf::from(&value);
+        if path.starts_with(&self.payload_prefix) || path.starts_with(self.bundle_root) {
+            return;
+        }
+        let mut mapped = self.payload_prefix.clone();
+        mapped.push(value.trim_start_matches('/'));
+        env_map.insert(key.to_string(), mapped.to_string_lossy().into_owned());
+    }
+
+    fn remap_abs_list_into_payload(&self, env_map: &mut BTreeMap<String, String>, key: &str) {
+        let Some(value) = env_map.get(key).cloned() else {
+            return;
+        };
+        if value.is_empty() {
+            return;
+        }
+        let remapped: Vec<String> = value
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(|entry| {
+                if !entry.starts_with('/') {
+                    return entry.to_string();
+                }
+                let path = PathBuf::from(entry);
+                if path.starts_with(&self.payload_prefix) || path.starts_with(self.bundle_root) {
+                    return entry.to_string();
+                }
+                let mut mapped = self.payload_prefix.clone();
+                mapped.push(entry.trim_start_matches('/'));
+                mapped.to_string_lossy().into_owned()
+            })
+            .collect();
+        if !remapped.is_empty() {
+            env_map.insert(key.to_string(), remapped.join(":"));
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let exe_path = env::current_exe().context("failed to resolve launcher path")?;
     let launcher_dir = exe_path
@@ -211,28 +269,16 @@ fn build_env_block(
         bundle_root.to_string_lossy().into_owned(),
     );
 
-    if let Some(java_home) = env_map.get("JAVA_HOME").cloned() {
-        if java_home.starts_with('/') {
-            let mut mapped = bundle_root.to_path_buf();
-            mapped.push("payload");
-            mapped.push(java_home.trim_start_matches('/'));
-            env_map.insert("JAVA_HOME".into(), mapped.to_string_lossy().into_owned());
-        }
-    }
+    let remapper = EnvRemapper::new(bundle_root);
+
+    remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
 
     // Map GOROOT (absolute) into bundle payload to make trimmed Go toolchains work.
-    if let Some(go_root) = env_map.get("GOROOT").cloned() {
-        if go_root.starts_with('/') {
-            let mut mapped = bundle_root.to_path_buf();
-            mapped.push("payload");
-            mapped.push(go_root.trim_start_matches('/'));
-            env_map.insert("GOROOT".into(), mapped.to_string_lossy().into_owned());
-        }
-    }
+    remapper.remap_abs_into_payload(&mut env_map, "GOROOT");
 
     if run_mode == RunMode::Host {
-        remap_host_env_path(bundle_root, &mut env_map, "PYTHONHOME");
-        remap_host_env_path_list(bundle_root, &mut env_map, "PYTHONPATH");
+        remapper.remap_abs_into_payload(&mut env_map, "PYTHONHOME");
+        remapper.remap_abs_list_into_payload(&mut env_map, "PYTHONPATH");
     }
 
     let mut mapped_path_entries: Vec<String> = Vec::new();
@@ -322,52 +368,6 @@ fn remap_path_entries(bundle_root: &Path, mode: RunMode, path: &str) -> Vec<Stri
                 .into_owned()
         })
         .collect()
-}
-
-fn remap_host_env_path(bundle_root: &Path, env_map: &mut BTreeMap<String, String>, key: &str) {
-    let Some(value) = env_map.get(key).cloned() else {
-        return;
-    };
-    if !value.starts_with('/') {
-        return;
-    }
-    let path = PathBuf::from(&value);
-    let payload_prefix = bundle_root.join("payload");
-    if path.starts_with(&payload_prefix) || path.starts_with(bundle_root) {
-        return;
-    }
-    let mut mapped = payload_prefix;
-    mapped.push(value.trim_start_matches('/'));
-    env_map.insert(key.to_string(), mapped.to_string_lossy().into_owned());
-}
-
-fn remap_host_env_path_list(bundle_root: &Path, env_map: &mut BTreeMap<String, String>, key: &str) {
-    let Some(value) = env_map.get(key).cloned() else {
-        return;
-    };
-    if value.is_empty() {
-        return;
-    }
-    let payload_prefix = bundle_root.join("payload");
-    let remapped: Vec<String> = value
-        .split(':')
-        .filter(|p| !p.is_empty())
-        .map(|entry| {
-            if !entry.starts_with('/') {
-                return entry.to_string();
-            }
-            let p = PathBuf::from(entry);
-            if p.starts_with(&payload_prefix) || p.starts_with(bundle_root) {
-                return entry.to_string();
-            }
-            let mut mapped = payload_prefix.clone();
-            mapped.push(entry.trim_start_matches('/'));
-            mapped.to_string_lossy().into_owned()
-        })
-        .collect();
-    if !remapped.is_empty() {
-        env_map.insert(key.to_string(), remapped.join(":"));
-    }
 }
 
 fn dedup_strings(values: &mut Vec<String>) {
@@ -686,4 +686,48 @@ fn exec_chroot(
     // Once chrooted, the PT_INTERP inside the payload points to bundled ld-linux; exec the entry
     // directly so /proc/self/exe matches the intended binary (important for multi-call binaries).
     exec_static(entry, argv, envp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvRemapper, RunMode};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    #[test]
+    fn remap_abs_into_payload_is_idempotent() {
+        let bundle_root = Path::new("/tmp/bundle");
+        let remapper = EnvRemapper::new(bundle_root);
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+
+        env_map.insert("JAVA_HOME".into(), "/usr/lib/jvm/java".into());
+        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
+        assert_eq!(
+            env_map.get("JAVA_HOME").unwrap(),
+            "/tmp/bundle/payload/usr/lib/jvm/java"
+        );
+
+        remapper.remap_abs_into_payload(&mut env_map, "JAVA_HOME");
+        assert_eq!(
+            env_map.get("JAVA_HOME").unwrap(),
+            "/tmp/bundle/payload/usr/lib/jvm/java"
+        );
+    }
+
+    #[test]
+    fn remap_abs_list_into_payload_keeps_relative_entries() {
+        let bundle_root = Path::new("/tmp/bundle");
+        let remapper = EnvRemapper::new(bundle_root);
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        env_map.insert("PYTHONPATH".into(), "rel:/usr/lib/python3.10:/x".into());
+
+        // Mimic host-only behavior at call site; the method itself does not check RunMode.
+        let _mode = RunMode::Host;
+        remapper.remap_abs_list_into_payload(&mut env_map, "PYTHONPATH");
+
+        assert_eq!(
+            env_map.get("PYTHONPATH").unwrap(),
+            "rel:/tmp/bundle/payload/usr/lib/python3.10:/tmp/bundle/payload/x"
+        );
+    }
 }
