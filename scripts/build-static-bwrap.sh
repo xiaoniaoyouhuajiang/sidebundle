@@ -59,12 +59,20 @@ meson setup _builddir \
   -Dprefer_static=true \
   -Dc_link_args=-static-pie
 
-# Best-effort: ensure a "seccomp" option exists and is enabled; fail hard if not available.
+#
+# seccomp support:
+# bubblewrap's Meson options vary across versions. Some versions expose a feature option (e.g.
+# `-Dseccomp=enabled`), while others auto-detect libseccomp when present.
+#
+# We treat libseccomp as a hard requirement and validate seccomp availability post-build via
+# `bwrap --help` (see verify script).
+#
+# Install static libseccomp if available (package name differs across Alpine versions).
+apk add --no-cache libseccomp-static 2>/dev/null ||:
 if meson configure _builddir 2>/dev/null | grep -qE '^[[:space:]]*seccomp[[:space:]]' ; then
   meson configure _builddir -Dseccomp=enabled
 else
-  echo "meson option 'seccomp' not found; cannot guarantee seccomp support" >&2
-  exit 1
+  echo "warn: meson option 'seccomp' not found; relying on libseccomp auto-detection" >&2
 fi
 
 meson compile -C _builddir

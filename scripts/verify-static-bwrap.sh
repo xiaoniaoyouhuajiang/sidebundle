@@ -62,6 +62,12 @@ readelf -l ./bwrap | grep -q 'INTERP' && {
 
 ./bwrap --version >/dev/null
 
+./bwrap --help 2>/dev/null | grep -q -- '--seccomp' || {
+  echo "bwrap --help does not mention --seccomp; expected seccomp support to be enabled" >&2
+  ./bwrap --help >&2 ||:
+  exit 1
+}
+
 echo "VERSION:"
 sed -n '1,200p' ./VERSION
 
@@ -78,4 +84,3 @@ if [ "${VERIFY_BWRAP_RUN:-0}" = "1" ]; then
 fi
 
 echo "ok: verified $tarball"
-
