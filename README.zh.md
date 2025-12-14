@@ -5,7 +5,11 @@
 [![CI](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml)
 [![smoke-tests](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml)
 
-sidebundle 用于从动态链接的 ELF 可执行文件构建可迁移的离线包。CLI 可以从宿主机或 OCI 镜像（Docker/Podman）采集可执行文件，静态解析和运行时跟踪它们加载的文件，并生成可移植的目录结构（附启动器和 manifest）。
+sidebundle 用于从 ELF 可执行文件（动态/静态）与 shebang 脚本构建可迁移的离线包。CLI 可以从宿主机或 OCI 镜像（Docker/Podman）采集入口文件，静态解析和运行时跟踪它们加载/访问的依赖，并生成可移植的目录结构（附启动器和 manifest）。
+
+启发来源：
+- https://github.com/intoli/exodus
+- https://github.com/ValveSoftware/steam-runtime
 
 ![head](./statics/header_n.webp)
 

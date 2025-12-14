@@ -5,9 +5,13 @@ English | [中文](README.zh.md)
 [![CI](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml)
 [![smoke-tests](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml)
 
-sidebundle builds relocatable bundles from dynamically linked ELF binaries. The CLI can collect
-executables from the host filesystem or from OCI images (Docker/Podman), trace the files that are
-loaded at runtime, and emit a portable directory tree with launchers and a manifest.
+sidebundle builds relocatable bundles from ELF executables (dynamic or static) and shebang scripts.
+The CLI can collect entries from the host filesystem or from OCI images (Docker/Podman), trace
+runtime-loaded files, and emit a portable bundle directory with launchers and a manifest.
+
+Inspired by:
+- https://github.com/intoli/exodus
+- https://github.com/ValveSoftware/steam-runtime
 
 ![head](./statics/header_n.webp)
 
