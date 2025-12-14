@@ -2,6 +2,9 @@
 
 English | [中文](README.zh.md)
 
+[![CI](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml)
+[![smoke-tests](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml)
+
 sidebundle builds relocatable bundles from dynamically linked ELF binaries. The CLI can collect
 executables from the host filesystem or from OCI images (Docker/Podman), trace the files that are
 loaded at runtime, and emit a portable directory tree with launchers and a manifest.
@@ -9,12 +12,12 @@ loaded at runtime, and emit a portable directory tree with launchers and a manif
 ![head](./statics/header_n.webp)
 
 ## Documentation
-- Install & build: `docs/install_en.md`
-- CLI usage (advanced): `docs/usage_en.md`
-- Trace backends & principles: `docs/tracing_en.md`
-- Permissions matrix: `docs/permissions_en.md`
-- Special handling notes (CN): `docs/special_handling.md`
-- FAQ (CN): `docs/faq.md`
+- [Install & build](docs/install_en.md)
+- [CLI usage (advanced)](docs/usage_en.md)
+- [Trace backends & principles](docs/tracing_en.md)
+- [Permissions matrix](docs/permissions_en.md)
+- [Special handling notes (CN)](docs/special_handling.md)
+- [FAQ (CN)](docs/faq.md)
 
 ## Before & after
 `scip-index` bundle size comparison

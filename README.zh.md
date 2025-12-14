@@ -2,6 +2,9 @@
 
 中文 | [English](README.md)
 
+[![CI](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/ci.yml)
+[![smoke-tests](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/xiaoniaoyouhuajiang/sidebundle/actions/workflows/smoke-test.yml)
+
 sidebundle 用于从动态链接的 ELF 可执行文件构建可迁移的离线包。CLI 可以从宿主机或 OCI 镜像（Docker/Podman）采集可执行文件，静态解析和运行时跟踪它们加载的文件，并生成可移植的目录结构（附启动器和 manifest）。
 
 ![head](./statics/header_n.webp)
@@ -11,12 +14,12 @@ sidebundle 用于从动态链接的 ELF 可执行文件构建可迁移的离线�
 * 将软件/工作流依赖的多个elf打包成一个可迁移的bundle
 
 ## 文档入口
-- [安装/构建/开发](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/install.md)
-- [更详细的 CLI 用法](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/usage.md)
-- [tracing backend](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/tracing.md)
-- [权限矩阵](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/permissions.md)
-- [特殊场景备忘](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/special_handling.md)
-- [FAQ](https://github.com/xiaoniaoyouhuajiang/sidebundle/blob/docs-permissions/docs/faq.md)
+- [安装/构建/开发](docs/install.md)
+- [更详细的 CLI 用法](docs/usage.md)
+- [tracing backend](docs/tracing.md)
+- [权限矩阵](docs/permissions.md)
+- [特殊场景备忘](docs/special_handling.md)
+- [FAQ](docs/faq.md)
 
 ## 效果演示
 scip-index应用打包前后占用空间对比
