@@ -47,8 +47,8 @@ if ! command -v readelf >/dev/null 2>&1; then
   exit 1
 fi
 
-file ./bwrap | grep -qi 'statically linked' || {
-  echo "bwrap does not look statically linked" >&2
+file ./bwrap | grep -Eqi 'statically linked|static-pie linked' || {
+  echo "bwrap does not look fully static (expected static or static-pie)" >&2
   file ./bwrap >&2 ||:
   exit 1
 }

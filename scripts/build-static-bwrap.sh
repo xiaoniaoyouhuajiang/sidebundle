@@ -86,8 +86,9 @@ if [ ! -x "$bwrap_bin" ]; then
   exit 1
 fi
 
-file "$bwrap_bin" | grep -qi 'statically linked' || {
-  echo "bwrap does not look statically linked; build is not fully static" >&2
+# `file` reports fully static binaries as either "statically linked" or "static-pie linked".
+file "$bwrap_bin" | grep -Eqi 'statically linked|static-pie linked' || {
+  echo "bwrap does not look fully static (expected static or static-pie)" >&2
   file "$bwrap_bin" >&2 ||:
   exit 1
 }
