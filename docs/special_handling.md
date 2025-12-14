@@ -4,7 +4,8 @@
 
 ## 多调用（二进制自检）兼容
 - 目的：busybox / uutils coreutils 等多调用 ELF 会校验 `argv0` 与 `/proc/self/exe` 指向的可执行文件是否一致，否则拒绝执行。
-- 打包侧：优先将 data 中的文件以硬链接形式放到 `payload/`，避免 `/proc/self/exe` 落在哈希路径上。（`sidebundle-packager/src/lib.rs:link_or_copy`）
+- 打包侧：优先将 data 中的文件以硬链接形式放到 `payload/`（失败回退 copy），避免 `/proc/self/exe` 落在哈希路径上。（`sidebundle-packager/src/lib.rs:link_or_copy`）
+  - 备注：运行时别名（alias）也优先使用硬链接（见“运行时别名与设备节点”），并在 `info` 日志中统计 alias 占用（`packager: alias files: ...`，`sidebundle-packager/src/lib.rs`）。
 - 运行侧：
   - Host 模式依旧显式调用打包的 ld-linux，保持 ABI 保证；多调用需要使用下述隔离模式。
   - bwrap/chroot 模式直接 exec 入口（不显式 ld-linux），根指向 payload，PT_INTERP 使用打包的 ld-linux，`/proc/self/exe` 与入口一致，校验可通过。（`sidebundle-launcher/src/main.rs:exec_bwrap/exec_chroot`）
@@ -13,10 +14,21 @@
 - 目的：node 解析 shebang 时若跟随符号链接，部分脚本会出问题。
 - 处理：为 node 解释器注入 `NODE_OPTIONS=--preserve-symlinks-main --preserve-symlinks`。（`sidebundle-packager/src/launcher.rs:inject_script_metadata`）
   - 额外：对 node shebang 脚本注入 `NODE_PATH=/usr/share/nodejs`，以兼容 Debian/Ubuntu 的全局 JS 模块布局（如 npm 运行时依赖 semver 等）。
+- 已知限制：npm 这类“资源树 + 多入口路径”软件，运行时可能依赖某条“原始路径/拓扑”上的入口文件（而不仅仅是解析后的真实文件）。在 sidebundle 默认“不落盘依赖 symlink（见下）”的策略下，即使 trace 捕获到了真实文件，也可能仍然缺少某条路径上所需的入口文件/目录结构，导致 `Cannot find module ...` 之类问题（目前 smoke test 里对 npm 的覆盖仍是 TODO）。
+
+## 依赖符号链接策略（默认不落盘 symlink）
+- 背景：依赖闭包可以同时包含“文件”和“符号链接”。但符号链接一旦被原样打进 bundle，容易引入两类问题：循环链接/断链（特别是在大量 `--copy-dir` 或复杂 runtime 目录树下），以及宿主特定路径语义被带入 bundle（可迁移性与可预测性变差）。
+- 现状策略：
+  - CLI 在写入闭包前会对 symlink 做去重与 cycle 过滤（`sidebundle-cli/src/main.rs:sanitize_symlinks`）。
+  - 打包阶段默认不把闭包中的依赖 symlink 落盘，而是忽略并记录 debug（`packager: ignoring symlink ... (symlink emission disabled)`，`sidebundle-packager/src/lib.rs`）。
+- 兜底方式：对“同一文件的多路径可达”需求，优先使用 runtime alias（把 canonical 文件以硬链接/复制的方式放到别名路径上），而不是依赖 symlink（见“运行时别名与设备节点”）。
 
 ## PATH/LD_LIBRARY_PATH 映射与 JVM 兼容
 - 目的：Host 模式下把打包路径放到前面，避免回落宿主；JVM/dlopen 常需要兄弟 lib 目录。
-- 处理：映射绝对 PATH 条目到 bundle，追加每个 bin 目录的 `lib`/`lib/server` 到 `LD_LIBRARY_PATH`，并将绝对 `JAVA_HOME`/`GOROOT` 映射到 payload。（`sidebundle-launcher/src/main.rs:build_env_block`）
+- 处理：通过统一的 EnvRemapper 收敛 Host 模式下的环境变量重映射与补全逻辑（`sidebundle-launcher/src/main.rs:build_env_block`）。
+  - 映射绝对 `PATH` 条目到 bundle，并对每个 bin 目录追加 `lib`/`lib/server` 到 `LD_LIBRARY_PATH`（用于覆盖 dlopen/运行时加载）。
+  - 将绝对 `JAVA_HOME`/`GOROOT`（以及 Python 相关路径变量）映射到 payload，对“强依赖绝对路径”的 runtime 更友好。
+  - 说明：不是“无脑 remap 所有 env”，而是以白名单/规则收敛关键变量，避免把宿主路径语义不可控地注入 bundle 运行环境。
 
 ## 系统配置文件兜底
 - 目的：镜像内可能缺失或为空的基础配置。
@@ -27,6 +39,9 @@
 - 处理：
   - 创建常见字符设备节点 `/dev/null`、`/dev/tty`、`/dev/zero`、`/dev/urandom`（若无法 mknod 则写空文件）。`sidebundle-packager/src/lib.rs:ensure_device_nodes`
   - 常见解释器别名（如 `python3` → `python3.10`）按存在性写入符号链接。`sidebundle-packager/src/lib.rs:ensure_aliases`
+  - 运行时别名（runtime alias，多路径可达）：trace 记录的 original path 与 resolved/canonical path 不一致时，打包时会在 alias 路径“再放一份”同一文件，避免运行时只认 original path 导致缺文件。
+    - 实现：优先 `hard_link(canonical, alias)`，失败回退 copy（`sidebundle-packager/src/lib.rs`）。
+    - 统计：以 `info` 日志输出 alias 文件数量及占用（逻辑大小/实际新增分配，`packager: alias files: ...`，`sidebundle-packager/src/lib.rs`）。
 
 ## 数据目录镜像
 - 目的：在 chroot 模式下 `/data` 可读/可写且避免重复拷贝。
@@ -35,6 +50,7 @@
 ## 自解压 shim（分发便利性）
 - 目的：减少分发/安装步骤，提供单文件自解压包装。
 - 处理：`--emit-shim` 时，打包阶段将 bundle 打成压缩 tar，附加到 shim stub，生成 `shims/<entry>` 可执行，运行时解压到缓存目录并调用 launcher。（`sidebundle-packager/src/shim.rs`, `sidebundle-shim` crate）
+- 体积注意：若 bundle 内存在大量 hardlink（例如 alias 机制带来的多路径），shim 的归档阶段会将同 inode 的重复文件写成 tar hardlink entry，避免重复写入数据块导致 shim 产物膨胀。（`sidebundle-packager/src/shim.rs:build_archive`）
 
 ## GPU/DRM 依赖过滤
 - 目的：避免误把宿主 GPU/DRM 相关库打包到可迁移 bundle 中，导致设备耦合或法律风险。
@@ -49,3 +65,4 @@
 ## TODO：语言运行时资源自动收集
 - 背景：Python/Node/Java 等语言层资源（stdlib、JS 内置、JRE modules/security 等）目前需用户通过 `::trace` 或 `--copy-dir` 明确引入；未采集会在运行时缺 `encodings`、内置 JS 等。
 - 方向：提供可选的语言感知运行时探测（非交互、可配置），自动读取 `sys.path`/Node 内置列表/JRE modules 等并收集对应资源，降低打包踩坑概率，同时允许禁用以保证安全可控。
+  - 例：Python 缺 `encodings`/stdlib、Node 缺全局模块树（`/usr/share/nodejs`）、Java 缺 `conf/security` 等配置时，往往并非 ELF 依赖闭包本身能够完全兜住，需要“语言层资源树”的显式/自动化收集策略配合。
