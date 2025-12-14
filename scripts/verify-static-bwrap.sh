@@ -27,7 +27,7 @@ if [ ! -d "./LICENSES" ]; then
   exit 1
 fi
 
-top="$(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort)"
+top="$(ls -1A | sort)"
 expected="$(printf '%s\n' LICENSES VERSION bwrap | sort)"
 if [ "$top" != "$expected" ]; then
   echo "unexpected tarball layout" >&2
