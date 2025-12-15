@@ -137,6 +137,60 @@ jobs:
           cp "$bin" "$out"
           sha256sum "$out" > "$out.sha256"
 
+      - name: Smoke test embedded bwrap (no system bwrap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="$GITHUB_WORKSPACE/target/embed-bwrap-smoke/${{ matrix.platform }}"
+          mkdir -p "$outdir"
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/out:rw" \
+            -w /out \
+            debian:12-slim \
+            /bin/sh -lc '
+              set -eu
+
+              if command -v bwrap >/dev/null 2>&1; then
+                echo "unexpected system bwrap present in PATH" >&2
+                command -v bwrap >&2 || true
+                exit 1
+              fi
+              if [ -e /usr/bin/bwrap ] || [ -e /bin/bwrap ]; then
+                echo "unexpected system bwrap present in filesystem" >&2
+                ls -la /usr/bin/bwrap /bin/bwrap 2>/dev/null || true
+                exit 1
+              fi
+
+              cp "/ws/sidebundle-${{ matrix.arch_suffix }}-embedded-bwrap" ./sidebundle-cli
+              chmod +x ./sidebundle-cli
+
+              ./sidebundle-cli create \
+                --from-host /bin/true \
+                --name demo \
+                --out-dir /out \
+                --run-mode bwrap \
+                --trace-backend off
+
+              /out/demo/bin/true
+
+              bwrap_path=""
+              for candidate in /root/.cache/sidebundle/bwrap/*/*/bwrap; do
+                if [ -f "$candidate" ]; then
+                  bwrap_path="$candidate"
+                  break
+                fi
+              done
+              if [ -z "$bwrap_path" ]; then
+                echo "embedded bwrap not extracted to cache" >&2
+                ls -la /root/.cache/sidebundle 2>/dev/null || true
+                exit 1
+              fi
+              "$bwrap_path" --version >/dev/null
+            '
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
