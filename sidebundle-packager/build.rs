@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SIDEBUNDLE_EMBED_BWRAP_BIN");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let workspace_root = manifest
@@ -32,6 +33,9 @@ fn main() {
         .arg(&target)
         .arg("--target-dir")
         .arg(&launcher_target_dir);
+    if env::var_os("SIDEBUNDLE_EMBED_BWRAP_BIN").is_some() {
+        command.arg("--features").arg("embedded-bwrap");
+    }
     if profile == "release" {
         command.arg("--release");
     } else if profile != "debug" {

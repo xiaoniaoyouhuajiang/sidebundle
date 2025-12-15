@@ -1328,7 +1328,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "sidebundle-core",
+ "tempfile",
 ]
 
 [[package]]
