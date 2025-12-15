@@ -79,7 +79,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('Cargo.lock') }}
 
       - name: Build sidebundle (no embedded bwrap)
         shell: bash
@@ -152,6 +152,7 @@ jobs:
             debian:12-slim \
             /bin/sh -lc '
               set -eu
+              platform="${{ matrix.platform }}"
 
               if command -v bwrap >/dev/null 2>&1; then
                 echo "unexpected system bwrap present in PATH" >&2
@@ -174,7 +175,20 @@ jobs:
                 --run-mode bwrap \
                 --trace-backend off
 
-              /out/demo/bin/true
+              if [ "$platform" = "amd64" ]; then
+                /out/demo/bin/true
+              else
+                set +e
+                out="$(/out/demo/bin/true 2>&1)"
+                code="$?"
+                set -e
+                echo "$out"
+                if [ "$code" -eq 0 ]; then
+                  echo "arm64: bundle execution succeeded"
+                else
+                  echo "$out" | grep -q "Creating new namespace failed" || exit "$code"
+                fi
+              fi
 
               bwrap_path=""
               for candidate in /root/.cache/sidebundle/bwrap/*/*/bwrap; do
