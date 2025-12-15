@@ -1,0 +1,70 @@
+name: bwrap-static
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly check to catch toolchain drift.
+    - cron: "0 3 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/build-static-bwrap.sh"
+      - "scripts/verify-static-bwrap.sh"
+      - ".github/workflows/bwrap-static.yml"
+
+jobs:
+  build-and-verify:
+    name: build and verify (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup QEMU (arm64)
+        if: matrix.platform == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build static bwrap (Alpine, musl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="${GITHUB_WORKSPACE}/target/static-bwrap/${{ matrix.platform }}"
+          mkdir -p "$outdir"
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/outdir" \
+            -e BWRAP_TAG=v0.11.0 \
+            -e OUTDIR=/outdir \
+            alpine:3.20 \
+            /bin/sh /ws/scripts/build-static-bwrap.sh
+
+      - name: Verify tarball layout + static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="${GITHUB_WORKSPACE}/target/static-bwrap/${{ matrix.platform }}"
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/outdir" \
+            -e VERIFY_BWRAP_RUN=$([[ "${{ matrix.platform }}" == "amd64" ]] && echo 1 || echo 0) \
+            alpine:3.20 \
+            /bin/sh -lc '
+              apk add --no-cache file binutils tar zstd >/dev/null
+              ls -la /outdir
+              sh /ws/scripts/verify-static-bwrap.sh /outdir/bwrap-musl-$(uname -m).tar.zst
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwrap-musl-${{ matrix.platform }}
+          path: target/static-bwrap/${{ matrix.platform }}/bwrap-musl-*.tar.zst

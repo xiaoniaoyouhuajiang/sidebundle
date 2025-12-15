@@ -1,0 +1,251 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run uploads artifacts; publish creates a GitHub Release (tag only)"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - publish
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/bwrap-static.yml"
+      - "scripts/build-static-bwrap.sh"
+      - "scripts/verify-static-bwrap.sh"
+      - "sidebundle-launcher/**"
+      - "sidebundle-packager/build.rs"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  BWRAP_TAG: "v0.11.0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: amd64
+            arch_suffix: x86_64-musl
+          - target: aarch64-unknown-linux-musl
+            platform: arm64
+            arch_suffix: aarch64-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup QEMU (arm64)
+        if: matrix.platform == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          target: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Configure cross linker
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld" >> $GITHUB_ENV
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Cache cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build sidebundle (no embedded bwrap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/release-noembed/${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+          bin="$CARGO_TARGET_DIR/${{ matrix.target }}/release/sidebundle-cli"
+          out="sidebundle-${{ matrix.arch_suffix }}"
+          cp "$bin" "$out"
+          sha256sum "$out" > "$out.sha256"
+
+      - name: Build embedded bwrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="$GITHUB_WORKSPACE/target/embedded-bwrap/${{ matrix.platform }}"
+          mkdir -p "$outdir"
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/outdir" \
+            -e BWRAP_TAG="${BWRAP_TAG}" \
+            -e OUTDIR=/outdir \
+            alpine:3.20 \
+            /bin/sh /ws/scripts/build-static-bwrap.sh
+
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/outdir" \
+            -e VERIFY_BWRAP_RUN=$([[ "${{ matrix.platform }}" == "amd64" ]] && echo 1 || echo 0) \
+            alpine:3.20 \
+            /bin/sh -lc '
+              apk add --no-cache file binutils tar zstd >/dev/null
+              sh /ws/scripts/verify-static-bwrap.sh /outdir/bwrap-musl-$(uname -m).tar.zst
+            '
+
+          mkdir -p "$GITHUB_WORKSPACE/target/embedded-bwrap/bin/${{ matrix.platform }}"
+          tarball="$outdir/bwrap-musl-$([[ \"${{ matrix.platform }}\" == \"amd64\" ]] && echo x86_64 || echo aarch64).tar.zst"
+          tar --zstd -xf "$tarball" -C "$GITHUB_WORKSPACE/target/embedded-bwrap/bin/${{ matrix.platform }}"
+          chmod +x "$GITHUB_WORKSPACE/target/embedded-bwrap/bin/${{ matrix.platform }}/bwrap"
+
+      - name: Build sidebundle (embedded bwrap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SIDEBUNDLE_EMBED_BWRAP_BIN="$GITHUB_WORKSPACE/target/embedded-bwrap/bin/${{ matrix.platform }}/bwrap"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/release-embed/${{ matrix.target }}"
+          cargo build --release --target "${{ matrix.target }}"
+          bin="$CARGO_TARGET_DIR/${{ matrix.target }}/release/sidebundle-cli"
+          out="sidebundle-${{ matrix.arch_suffix }}-embedded-bwrap"
+          cp "$bin" "$out"
+          sha256sum "$out" > "$out.sha256"
+
+      - name: Smoke test embedded bwrap (no system bwrap)
+        shell: bash
+        run: |
+          set -euo pipefail
+          outdir="$GITHUB_WORKSPACE/target/embed-bwrap-smoke/${{ matrix.platform }}"
+          mkdir -p "$outdir"
+          docker run --rm \
+            --platform "linux/${{ matrix.platform }}" \
+            --privileged --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/ws:ro" \
+            -v "$outdir:/out:rw" \
+            -w /out \
+            debian:12-slim \
+            /bin/sh -lc '
+              set -eu
+              platform="${{ matrix.platform }}"
+
+              if command -v bwrap >/dev/null 2>&1; then
+                echo "unexpected system bwrap present in PATH" >&2
+                command -v bwrap >&2 || true
+                exit 1
+              fi
+              if [ -e /usr/bin/bwrap ] || [ -e /bin/bwrap ]; then
+                echo "unexpected system bwrap present in filesystem" >&2
+                ls -la /usr/bin/bwrap /bin/bwrap 2>/dev/null || true
+                exit 1
+              fi
+
+              cp "/ws/sidebundle-${{ matrix.arch_suffix }}-embedded-bwrap" ./sidebundle-cli
+              chmod +x ./sidebundle-cli
+
+              ./sidebundle-cli create \
+                --from-host /bin/true \
+                --name demo \
+                --out-dir /out \
+                --run-mode bwrap \
+                --trace-backend off
+
+              if [ "$platform" = "amd64" ]; then
+                /out/demo/bin/true
+              else
+                set +e
+                out="$(/out/demo/bin/true 2>&1)"
+                code="$?"
+                set -e
+                echo "$out"
+                if [ "$code" -eq 0 ]; then
+                  echo "arm64: bundle execution succeeded"
+                else
+                  echo "$out" | grep -q "Creating new namespace failed" || exit "$code"
+                fi
+              fi
+
+              bwrap_path=""
+              for candidate in /root/.cache/sidebundle/bwrap/*/*/bwrap; do
+                if [ -f "$candidate" ]; then
+                  bwrap_path="$candidate"
+                  break
+                fi
+              done
+              if [ -z "$bwrap_path" ]; then
+                echo "embedded bwrap not extracted to cache" >&2
+                ls -la /root/.cache/sidebundle 2>/dev/null || true
+                exit 1
+              fi
+              "$bwrap_path" --version >/dev/null
+            '
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidebundle-${{ matrix.arch_suffix }}
+          path: |
+            sidebundle-${{ matrix.arch_suffix }}
+            sidebundle-${{ matrix.arch_suffix }}.sha256
+            sidebundle-${{ matrix.arch_suffix }}-embedded-bwrap
+            sidebundle-${{ matrix.arch_suffix }}-embedded-bwrap.sha256
+          retention-days: 7
+
+  publish:
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish')
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Ref guard (publish requires tag)
+        if: github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "publish mode requires a tag ref (v*)." >&2
+          exit 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-artifacts -type f -maxdepth 3 -name "sidebundle-*" -print -exec cp -f {} ./ \;
+          ls -la sidebundle-*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            sidebundle-*
+          generate_release_notes: true
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

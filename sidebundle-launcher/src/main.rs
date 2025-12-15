@@ -519,25 +519,121 @@ fn map_env_path(value: &str, mode: RunMode) -> PathBuf {
 fn find_bwrap() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SIDEBUNDLE_BWRAP") {
         let candidate = PathBuf::from(path);
-        if candidate.exists() {
+        if candidate.is_file() {
             return Some(candidate);
         }
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':').filter(|p| !p.is_empty()) {
             let candidate = PathBuf::from(dir).join("bwrap");
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     for candidate in ["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"] {
         let path = PathBuf::from(candidate);
-        if path.exists() {
+        if path.is_file() {
             return Some(path);
         }
     }
+
+    #[cfg(feature = "embedded-bwrap")]
+    if let Ok(path) = ensure_embedded_bwrap() {
+        return Some(path);
+    }
     None
+}
+
+#[cfg(feature = "embedded-bwrap")]
+const EMBEDDED_BWRAP_BYTES: &[u8] = include_bytes!(env!("SIDEBUNDLE_EMBED_BWRAP_BIN_PATH"));
+
+#[cfg(feature = "embedded-bwrap")]
+fn embedded_bwrap_is_placeholder() -> bool {
+    env!("SIDEBUNDLE_EMBED_BWRAP_IS_PLACEHOLDER") == "1"
+}
+
+#[cfg(feature = "embedded-bwrap")]
+fn embedded_bwrap_id() -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(EMBEDDED_BWRAP_BYTES);
+    format!("{:x}", digest)
+}
+
+#[cfg(feature = "embedded-bwrap")]
+fn embedded_bwrap_cache_path() -> Result<PathBuf> {
+    let cache_root = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| anyhow!("failed to resolve cache dir (XDG_CACHE_HOME or HOME)"))?;
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    };
+    Ok(cache_root
+        .join("sidebundle")
+        .join("bwrap")
+        .join(arch)
+        .join(embedded_bwrap_id())
+        .join("bwrap"))
+}
+
+#[cfg(feature = "embedded-bwrap")]
+fn ensure_embedded_bwrap() -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    if embedded_bwrap_is_placeholder() {
+        return Err(anyhow!(
+            "embedded bwrap not configured (missing SIDEBUNDLE_EMBED_BWRAP_BIN at build time)"
+        ));
+    }
+
+    let dest = embedded_bwrap_cache_path()?;
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    let Some(parent) = dest.parent() else {
+        return Err(anyhow!("invalid embedded bwrap cache path"));
+    };
+    fs::create_dir_all(parent).map_err(|e| anyhow!("failed to create cache dir: {e}"))?;
+
+    let lock_path = parent.join(".extract.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+    unsafe {
+        if libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| "flock failed for embedded bwrap extraction");
+        }
+    }
+
+    if dest.is_file() {
+        return Ok(dest);
+    }
+
+    let tmp = parent.join(format!(
+        ".bwrap.tmp.{}.{}",
+        std::process::id(),
+        embedded_bwrap_id()
+    ));
+    fs::write(&tmp, EMBEDDED_BWRAP_BYTES)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to chmod {}", tmp.display()))?;
+    fs::rename(&tmp, &dest)
+        .with_context(|| format!("failed to rename {} -> {}", tmp.display(), dest.display()))?;
+
+    Ok(dest)
 }
 
 fn os_to_cstring(value: &OsStr) -> Result<CString> {
@@ -693,6 +789,28 @@ mod tests {
     use super::{EnvRemapper, RunMode};
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    #[test]
+    fn find_bwrap_uses_explicit_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        unsafe {
+            std::env::set_var("SIDEBUNDLE_BWRAP", &fake);
+            std::env::set_var("PATH", "");
+        }
+
+        let found = super::find_bwrap().unwrap();
+        assert_eq!(found, fake);
+
+        unsafe {
+            std::env::remove_var("SIDEBUNDLE_BWRAP");
+        }
+    }
 
     #[test]
     fn remap_abs_into_payload_is_idempotent() {
