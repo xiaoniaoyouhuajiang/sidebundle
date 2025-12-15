@@ -19,6 +19,7 @@ Inspired by:
 - [Install & build](docs/install_en.md)
 - [CLI usage (advanced)](docs/usage_en.md)
 - [Trace backends & principles](docs/tracing_en.md)
+- [bwrap run mode & embedded-bwrap](docs/bwrap_en.md)
 - [Permissions matrix](docs/permissions_en.md)
 - [Special handling notes (CN)](docs/special_handling.md)
 - [FAQ (CN)](docs/faq.md)
@@ -43,6 +44,9 @@ https://github.com/user-attachments/assets/0d4f2ec8-2864-4a33-ab3f-e51773a10af2
 Grab the prebuilt musl-linked binary from GitHub Releases (e.g. `sidebundle-x86_64-musl` or `sidebundle-aarch64-musl`). It runs on
 any modern Linux without extra dependencies.
 
+Note: Releases also ship `sidebundle-*-musl-embedded-bwrap`, which embeds a static `bwrap`. This lets you use `--run-mode bwrap` on
+hosts without installing bubblewrap (user namespaces are still required). See `docs/bwrap_en.md`.
+
 ### Scenario A: Ship a Python script to machines without Python
 Assume your script has a proper shebang (e.g. `#!/usr/bin/env python3`):
 
@@ -56,6 +60,18 @@ Assume your script has a proper shebang (e.g. `#!/usr/bin/env python3`):
 ```
 
 `hello-py/bin/hello.py` will run Python from the bundle, even on hosts without Python installed.
+
+If you want a stricter relocatability check via bwrap on hosts without system bwrap, use the embedded build:
+
+```bash
+./sidebundle-x86_64-musl-embedded-bwrap create \
+  --name hello-py \
+  --from-host "./examples/hello.py" \
+  --out-dir bundles \
+  --run-mode bwrap \
+  --trace-backend combined \
+  --log-level info
+```
 
 ### Scenario B: Extract `jq` from an Alpine image to run on Ubuntu
 

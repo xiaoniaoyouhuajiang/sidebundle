@@ -33,3 +33,5 @@ bundle-name/
 - Java: copy the JRE tree and required config (e.g. `conf/security`).
 
 See `docs/usage.md` for full examples and troubleshooting links.
+
+For bwrap specifics (including embedded-bwrap builds), see `docs/bwrap_en.md`.

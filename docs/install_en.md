@@ -7,6 +7,11 @@ Prefer the prebuilt musl static binaries from GitHub Releases when you want maxi
 1. Download the musl static binary for your architecture:
    - `sidebundle-x86_64-musl`
    - `sidebundle-aarch64-musl`
+   - embedded bwrap builds:
+     - `sidebundle-x86_64-musl-embedded-bwrap`
+     - `sidebundle-aarch64-musl-embedded-bwrap`
+
+   The embedded-bwrap binaries allow `--run-mode bwrap` without installing system bubblewrap (user namespaces are still required). See `docs/bwrap_en.md`.
 2. Make it executable and check the help output:
 
 ```bash
@@ -36,4 +41,3 @@ cargo build --release --target aarch64-unknown-linux-musl
 ## Permissions and tracing
 
 See `docs/permissions_en.md` and `docs/tracing_en.md`.
-
