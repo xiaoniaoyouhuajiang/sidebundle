@@ -8,8 +8,6 @@ on:
       - 'README.zh.md'
   push:
     branches: [main]
-    tags:
-      - "v*"
     paths-ignore:
       - 'docs/**'
       - 'README.md'
