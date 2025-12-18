@@ -557,7 +557,7 @@ fn embedded_bwrap_is_placeholder() -> bool {
 fn embedded_bwrap_id() -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(EMBEDDED_BWRAP_BYTES);
-    format!("{:x}", digest)
+    format!("{digest:x}")
 }
 
 #[cfg(feature = "embedded-bwrap")]

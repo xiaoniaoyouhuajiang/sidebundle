@@ -276,12 +276,7 @@ impl Packager {
         }
 
         info!(
-            "packager: alias files: {} (hardlinks={}, copies={}, logical={} bytes, allocated={} bytes)",
-            alias_file_count,
-            alias_hardlink_count,
-            alias_copy_count,
-            alias_logical_bytes,
-            alias_allocated_bytes
+            "packager: alias files: {alias_file_count} (hardlinks={alias_hardlink_count}, copies={alias_copy_count}, logical={alias_logical_bytes} bytes, allocated={alias_allocated_bytes} bytes)"
         );
 
         for (missing_source, aliases) in alias_map {

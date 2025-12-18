@@ -21,6 +21,18 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(target_arch = "x86_64")]
+const SYS_STATX: i64 = 332;
+#[cfg(target_arch = "x86_64")]
+const SYS_OPENAT2: i64 = 437;
+#[cfg(target_arch = "x86_64")]
+const SYS_FACCESSAT2: i64 = 439;
+
+#[derive(Debug, Clone)]
+struct PendingSyscall {
+    path: String,
+}
+
 /// ptrace-based backend (legacy behavior).
 #[derive(Debug, Clone, Default)]
 pub struct PtraceBackend;
@@ -206,6 +218,7 @@ unsafe fn fanotify_child_main(root: Option<&Path>, argv: &[CString], envp: &[CSt
 unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
     let mut report = TraceReport::default();
     let mut entering: HashMap<Pid, bool> = HashMap::new();
+    let mut pending: HashMap<Pid, PendingSyscall> = HashMap::new();
 
     loop {
         match waitpid(Some(child), Some(WaitPidFlag::empty())) {
@@ -219,11 +232,9 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             }
             Ok(WaitStatus::PtraceSyscall(pid)) => {
                 let entry = entering.entry(pid).or_insert(true);
-                if *entry {
-                    if let Err(err) = handle_syscall(pid, &mut report) {
-                        ptrace::detach(pid, None).ok();
-                        return Err(err);
-                    }
+                if let Err(err) = handle_syscall(pid, *entry, &mut pending, &mut report) {
+                    ptrace::detach(pid, None).ok();
+                    return Err(err);
                 }
                 *entry = !*entry;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
@@ -334,33 +345,103 @@ fn record_fanotify_event(event: &nix::sys::fanotify::FanotifyEvent, report: &mut
 }
 
 #[cfg(target_arch = "x86_64")]
-fn handle_syscall(pid: Pid, report: &mut TraceReport) -> Result<(), TraceError> {
+fn handle_syscall(
+    pid: Pid,
+    entering: bool,
+    pending: &mut HashMap<Pid, PendingSyscall>,
+    report: &mut TraceReport,
+) -> Result<(), TraceError> {
     let regs = ptrace::getregs(pid).map_err(TraceError::Nix)?;
     let syscall = regs.orig_rax as i64;
-    let addr = match syscall {
-        libc::SYS_open => regs.rdi as usize,
-        libc::SYS_openat => regs.rsi as usize,
-        libc::SYS_execve => regs.rdi as usize,
-        libc::SYS_stat => regs.rdi as usize,
-        libc::SYS_newfstatat => regs.rsi as usize,
-        libc::SYS_lstat => regs.rdi as usize,
-        _ => 0,
-    };
-    if addr == 0 {
+
+    handle_syscall_regs(pid, entering, syscall, &regs, pending, report, |addr| {
+        read_string(pid, addr)
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn handle_syscall_regs(
+    pid: Pid,
+    entering: bool,
+    syscall: i64,
+    regs: &libc::user_regs_struct,
+    pending: &mut HashMap<Pid, PendingSyscall>,
+    report: &mut TraceReport,
+    mut read_path: impl FnMut(usize) -> Result<String, TraceError>,
+) -> Result<(), TraceError> {
+    if entering {
+        if syscall == libc::SYS_execve {
+            // execve success never returns; record on entry.
+            let addr = regs.rdi as usize;
+            if addr == 0 {
+                return Ok(());
+            }
+            let path = read_path(addr)?;
+            if !path.is_empty() {
+                report.record_path(PathBuf::from(path));
+            }
+            return Ok(());
+        }
+
+        let (dirfd, addr, is_at) = match syscall {
+            libc::SYS_open => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
+            libc::SYS_stat => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
+            libc::SYS_lstat => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
+            libc::SYS_readlink => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
+
+            libc::SYS_openat => (regs.rdi as i64, regs.rsi as usize, true),
+            libc::SYS_newfstatat => (regs.rdi as i64, regs.rsi as usize, true),
+            libc::SYS_readlinkat => (regs.rdi as i64, regs.rsi as usize, true),
+
+            SYS_STATX => (regs.rdi as i64, regs.rsi as usize, true),
+            SYS_OPENAT2 => (regs.rdi as i64, regs.rsi as usize, true),
+            SYS_FACCESSAT2 => (regs.rdi as i64, regs.rsi as usize, true),
+
+            _ => (0, 0, false),
+        };
+
+        if addr == 0 {
+            return Ok(());
+        }
+        let path = read_path(addr)?;
+        if path.is_empty() {
+            return Ok(());
+        }
+        if is_at && !should_record_at_path(dirfd, &path) {
+            return Ok(());
+        }
+        pending.insert(pid, PendingSyscall { path });
         return Ok(());
     }
-    let path = read_string(pid, addr)?;
-    if !path.is_empty() {
-        report.record_path(PathBuf::from(path));
+
+    // exit: only record on success
+    if let Some(p) = pending.remove(&pid) {
+        let ret = regs.rax as i64;
+        if ret >= 0 {
+            report.record_path(PathBuf::from(p.path));
+        }
     }
     Ok(())
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn handle_syscall(_pid: Pid, _report: &mut TraceReport) -> Result<(), TraceError> {
+fn handle_syscall(
+    _pid: Pid,
+    _entering: bool,
+    _pending: &mut HashMap<Pid, PendingSyscall>,
+    _report: &mut TraceReport,
+) -> Result<(), TraceError> {
     Err(TraceError::Unsupported(
         "ptrace backend is not supported on this architecture",
     ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn should_record_at_path(dirfd: i64, path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    dirfd == libc::AT_FDCWD as i64
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -415,9 +496,98 @@ fn map_trace_exit(exit: TraceExit) -> TraceError {
 mod tests {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
+    fn regs_for(syscall: i64) -> libc::user_regs_struct {
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = syscall as u64;
+        regs
+    }
+
     #[test]
     fn fanotify_backend_default_mask_includes_exec() {
         let backend = FanotifyBackend::new();
         assert!(backend.mask().contains(MaskFlags::FAN_OPEN_EXEC));
+    }
+
+    #[test]
+    fn at_path_filter_allows_absolute_paths() {
+        assert!(should_record_at_path(123, "/usr/lib/libc.so.6"));
+    }
+
+    #[test]
+    fn at_path_filter_rejects_relative_with_non_cwd_dirfd() {
+        assert!(!should_record_at_path(3, "encodings/__init__.py"));
+    }
+
+    #[test]
+    fn at_path_filter_allows_relative_with_at_fdcwd() {
+        assert!(should_record_at_path(
+            libc::AT_FDCWD as i64,
+            "encodings/__init__.py"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn ptrace_records_only_successful_probe_syscalls() {
+        let pid = Pid::from_raw(1234);
+        let mut pending = HashMap::new();
+        let mut report = TraceReport::default();
+
+        let mut regs = regs_for(SYS_STATX);
+        regs.rdi = libc::AT_FDCWD as u64;
+        regs.rsi = 0x1000;
+        handle_syscall_regs(
+            pid,
+            true,
+            SYS_STATX,
+            &regs,
+            &mut pending,
+            &mut report,
+            |_| Ok("encodings/__init__.py".to_string()),
+        )
+        .unwrap();
+
+        let mut regs_exit = regs_for(SYS_STATX);
+        regs_exit.rax = (-libc::ENOENT) as u64;
+        handle_syscall_regs(
+            pid,
+            false,
+            SYS_STATX,
+            &regs_exit,
+            &mut pending,
+            &mut report,
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        assert!(report.files.is_empty());
+
+        let mut regs = regs_for(SYS_STATX);
+        regs.rdi = libc::AT_FDCWD as u64;
+        regs.rsi = 0x2000;
+        handle_syscall_regs(
+            pid,
+            true,
+            SYS_STATX,
+            &regs,
+            &mut pending,
+            &mut report,
+            |_| Ok("encodings/__init__.py".to_string()),
+        )
+        .unwrap();
+
+        let mut regs_exit = regs_for(SYS_STATX);
+        regs_exit.rax = 0;
+        handle_syscall_regs(
+            pid,
+            false,
+            SYS_STATX,
+            &regs_exit,
+            &mut pending,
+            &mut report,
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        assert!(report.files.contains(Path::new("encodings/__init__.py")));
     }
 }
