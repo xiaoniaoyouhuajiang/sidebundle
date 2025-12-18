@@ -28,10 +28,15 @@ const SYS_OPENAT2: i64 = 437;
 #[cfg(target_arch = "x86_64")]
 const SYS_FACCESSAT2: i64 = 439;
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone)]
 struct PendingSyscall {
     path: String,
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Debug, Clone, Default)]
+struct PendingSyscall;
 
 /// ptrace-based backend (legacy behavior).
 #[derive(Debug, Clone, Default)]
