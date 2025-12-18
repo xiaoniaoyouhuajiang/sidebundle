@@ -72,7 +72,7 @@ sidebundle-cli create \
 sidebundle 的 launcher 有多种运行模式：
 
 - `host`：直接在宿主上运行（会显式使用 bundle 内 `ld-linux` 以保证 ABI），但更容易“被宿主环境兜底”，因此迁移验证能力较弱。
-- `bwrap`：使用 bubblewrap 把 `/` 映射到 `payload/` 运行，能最大化暴露缺依赖/路径不一致问题（需要系统有 `bwrap`，且允许 userns）。
+- `bwrap`：使用 bubblewrap 把 `/` 映射到 `payload/` 运行，能最大化暴露缺依赖/路径不一致问题（需要系统有 `bwrap`，且允许 userns；或使用 embedded-bwrap 版本，详见 `docs/bwrap.md`）。
 - `chroot`：类似 `bwrap` 的根切换语义，通常需要更高权限或更受限的环境支持。
 
 经验法则：

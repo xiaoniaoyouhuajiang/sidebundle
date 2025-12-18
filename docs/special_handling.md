@@ -52,6 +52,13 @@
 - 处理：`--emit-shim` 时，打包阶段将 bundle 打成压缩 tar，附加到 shim stub，生成 `shims/<entry>` 可执行，运行时解压到缓存目录并调用 launcher。（`sidebundle-packager/src/shim.rs`, `sidebundle-shim` crate）
 - 体积注意：若 bundle 内存在大量 hardlink（例如 alias 机制带来的多路径），shim 的归档阶段会将同 inode 的重复文件写成 tar hardlink entry，避免重复写入数据块导致 shim 产物膨胀。（`sidebundle-packager/src/shim.rs:build_archive`）
 
+## embedded-bwrap（无需系统安装 bwrap）
+- 目的：在目标机无法/不便安装 bubblewrap（例如离线内网、权限受限但允许 userns 的环境）时，仍能使用 `--run-mode bwrap` 做更严格的迁移验证与运行。
+- 交付：Releases 提供 `sidebundle-*-musl-embedded-bwrap`，内嵌静态 bwrap。
+- 行为：第一次需要 bwrap 时会解出到 `~/.cache/sidebundle/bwrap/<arch>/<sha256>/bwrap`，后续复用缓存命中。
+- 覆盖：可用 `SIDEBUNDLE_BWRAP=/abs/path` 强制指定 bwrap（优先级高于系统/内嵌）。
+- 限制：embedded-bwrap 不等价于“任何内核都能 bwrap”。若内核不支持/禁用 unprivileged userns（或容器限制），bwrap 仍会失败，此时需换环境或改用 `host/chroot`。详见 `docs/bwrap.md`。
+
 ## GPU/DRM 依赖过滤
 - 目的：避免误把宿主 GPU/DRM 相关库打包到可迁移 bundle 中，导致设备耦合或法律风险。
 - 默认行为：过滤常见前缀如 `libdrm`、`libnvidia*`、`libgl*`、`libvulkan`、`libcuda` 等，不写入闭包。（过滤表见 `sidebundle-closure/src/lib.rs:GPU_LIB_PREFIXES`）

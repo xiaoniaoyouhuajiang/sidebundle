@@ -5,9 +5,18 @@
 ## 下载安装（推荐）
 
 1. 从 GitHub Releases 下载与你的 CPU 架构匹配的静态二进制：
-   - `sidebundle-x86_64-musl`
-   - `sidebundle-aarch64-musl`
-2. 放到 `PATH` 中并验证：
+   - 常规版（不内嵌 bwrap）：`sidebundle-x86_64-musl` / `sidebundle-aarch64-musl`
+   - embedded-bwrap 版（内嵌静态 bwrap）：`sidebundle-x86_64-musl-embedded-bwrap` / `sidebundle-aarch64-musl-embedded-bwrap`
+
+   embedded-bwrap 版可在目标机没有安装 bwrap 时使用 `--run-mode bwrap`，但仍需要内核允许 unprivileged userns。详见 `docs/bwrap.md`。
+
+2. （可选）校验 SHA256：
+
+```bash
+sha256sum -c sidebundle-*.sha256
+```
+
+3. 放到 `PATH` 中并验证：
 
 ```bash
 chmod +x ./sidebundle-*-musl
@@ -52,7 +61,7 @@ cargo build --release --target aarch64-unknown-linux-musl
 sidebundle 的“运行时”是指：打包后的 bundle 在目标机器上执行 `bin/<entry>`。
 
 - `Host` 模式：通常无额外依赖（但更容易受宿主环境影响）。
-- `Bwrap` 模式：需要系统安装 `bwrap`（bubblewrap），且内核/发行版允许 unprivileged user namespace。
+- `Bwrap` 模式：需要系统安装 `bwrap`（bubblewrap），且内核/发行版允许 unprivileged user namespace；或使用 embedded-bwrap 版本（见 `docs/bwrap.md`）。
 - `Chroot` 模式：通常需要 root 或等价权限（取决于实现与 mount 行为）。
 
 跟踪（trace）阶段也可能需要额外权限，详见 `docs/permissions.md`。
@@ -78,4 +87,3 @@ sidebundle-cli --log-level debug create --help
 - 跟踪后端/权限矩阵：`docs/tracing.md`、`docs/permissions.md`
 - 特殊场景备忘：`docs/special_handling.md`
 - 常见报错排查：`docs/faq.md`
-
