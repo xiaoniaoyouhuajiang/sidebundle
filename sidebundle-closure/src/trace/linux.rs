@@ -8,6 +8,7 @@ use nix::sys::ptrace::AddressType;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, chroot, execve, fork, ForkResult, Pid};
+use sidebundle_core::TraceAccess;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString, OsString};
@@ -32,6 +33,7 @@ const SYS_FACCESSAT2: i64 = 439;
 #[derive(Debug, Clone)]
 struct PendingSyscall {
     path: String,
+    access: TraceAccess,
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -444,7 +446,11 @@ fn record_fanotify_event(event: &nix::sys::fanotify::FanotifyEvent, report: &mut
     if let Some(fd) = event.fd() {
         let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
         if let Ok(target) = fs::read_link(&proc_path) {
-            report.record_path(target);
+            let mut access = TraceAccess::OPEN;
+            if mask.contains(MaskFlags::FAN_OPEN_EXEC) {
+                access.insert(TraceAccess::EXEC);
+            }
+            report.record_path_with_access(target, access);
         }
     }
 }
@@ -483,26 +489,46 @@ fn handle_syscall_regs(
             }
             let path = read_path(addr)?;
             if !path.is_empty() {
-                report.record_path(PathBuf::from(path));
+                report.record_path_with_access(PathBuf::from(path), TraceAccess::EXEC);
             }
             return Ok(());
         }
 
-        let (dirfd, addr, is_at) = match syscall {
-            libc::SYS_open => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
-            libc::SYS_stat => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
-            libc::SYS_lstat => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
-            libc::SYS_readlink => (libc::AT_FDCWD as i64, regs.rdi as usize, false),
+        let (dirfd, addr, is_at, access) = match syscall {
+            libc::SYS_open => (
+                libc::AT_FDCWD as i64,
+                regs.rdi as usize,
+                false,
+                TraceAccess::OPEN,
+            ),
+            libc::SYS_stat => (
+                libc::AT_FDCWD as i64,
+                regs.rdi as usize,
+                false,
+                TraceAccess::STAT,
+            ),
+            libc::SYS_lstat => (
+                libc::AT_FDCWD as i64,
+                regs.rdi as usize,
+                false,
+                TraceAccess::LINK,
+            ),
+            libc::SYS_readlink => (
+                libc::AT_FDCWD as i64,
+                regs.rdi as usize,
+                false,
+                TraceAccess::LINK,
+            ),
 
-            libc::SYS_openat => (regs.rdi as i64, regs.rsi as usize, true),
-            libc::SYS_newfstatat => (regs.rdi as i64, regs.rsi as usize, true),
-            libc::SYS_readlinkat => (regs.rdi as i64, regs.rsi as usize, true),
+            libc::SYS_openat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
+            libc::SYS_newfstatat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
+            libc::SYS_readlinkat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::LINK),
 
-            SYS_STATX => (regs.rdi as i64, regs.rsi as usize, true),
-            SYS_OPENAT2 => (regs.rdi as i64, regs.rsi as usize, true),
-            SYS_FACCESSAT2 => (regs.rdi as i64, regs.rsi as usize, true),
+            SYS_STATX => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
+            SYS_OPENAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
+            SYS_FACCESSAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
 
-            _ => (0, 0, false),
+            _ => (0, 0, false, TraceAccess::empty()),
         };
 
         if addr == 0 {
@@ -515,7 +541,7 @@ fn handle_syscall_regs(
         if is_at && !should_record_at_path(dirfd, &path) {
             return Ok(());
         }
-        pending.insert(pid, PendingSyscall { path });
+        pending.insert(pid, PendingSyscall { path, access });
         return Ok(());
     }
 
@@ -523,7 +549,7 @@ fn handle_syscall_regs(
     if let Some(p) = pending.remove(&pid) {
         let ret = regs.rax as i64;
         if ret >= 0 {
-            report.record_path(PathBuf::from(p.path));
+            report.record_path_with_access(PathBuf::from(p.path), p.access);
         }
     }
     Ok(())
@@ -699,7 +725,9 @@ mod tests {
             |_| Ok(String::new()),
         )
         .unwrap();
-        assert!(report.files.contains(Path::new("encodings/__init__.py")));
+        assert!(report
+            .files
+            .contains_key(Path::new("encodings/__init__.py")));
     }
 
     #[test]
@@ -768,8 +796,8 @@ mod tests {
             |_| Ok(String::new()),
         )
         .unwrap();
-        assert!(report.files.contains(Path::new("a.py")));
-        assert!(!report.files.contains(Path::new("b.py")));
+        assert!(report.files.contains_key(Path::new("a.py")));
+        assert!(!report.files.contains_key(Path::new("b.py")));
 
         let mut regs_exit_b = regs_for(SYS_STATX);
         regs_exit_b.rax = 0;
@@ -783,6 +811,6 @@ mod tests {
             |_| Ok(String::new()),
         )
         .unwrap();
-        assert!(report.files.contains(Path::new("b.py")));
+        assert!(report.files.contains_key(Path::new("b.py")));
     }
 }

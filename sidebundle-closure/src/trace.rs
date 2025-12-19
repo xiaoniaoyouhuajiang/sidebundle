@@ -1,7 +1,7 @@
 use crate::PathResolver;
 use nix::errno::Errno;
-use sidebundle_core::LogicalPath;
-use std::collections::BTreeSet;
+use sidebundle_core::{LogicalPath, TraceAccess};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,8 @@ mod agent;
 
 pub use agent::{
     AgentEngine, AgentEngineError, AgentTraceBackend, TraceCommand as AgentTraceCommand,
-    TraceLimits, TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION, TRACE_SPEC_VERSION,
+    TraceLimits, TraceSpec, TraceSpecRecord, TraceSpecReport, TRACE_REPORT_VERSION,
+    TRACE_SPEC_VERSION,
 };
 
 #[cfg(target_os = "linux")]
@@ -203,31 +204,38 @@ pub struct TraceArtifact {
     pub runtime_path: PathBuf,
     pub host_path: Option<PathBuf>,
     pub logical_path: Option<LogicalPath>,
+    pub access: TraceAccess,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TraceReport {
-    pub files: BTreeSet<PathBuf>,
+    pub files: BTreeMap<PathBuf, TraceAccess>,
 }
 
 impl TraceReport {
     pub fn record_path(&mut self, path: PathBuf) {
+        self.record_path_with_access(path, TraceAccess::OPEN);
+    }
+
+    pub fn record_path_with_access(&mut self, path: PathBuf, access: TraceAccess) {
         if path.as_os_str().is_empty() {
             return;
         }
-        self.files.insert(path);
+        let entry = self.files.entry(path).or_insert_with(TraceAccess::empty);
+        entry.insert(access);
     }
 
     pub fn extend(&mut self, other: TraceReport) {
-        for path in other.files {
-            self.files.insert(path);
+        for (path, access) in other.files {
+            let entry = self.files.entry(path).or_insert_with(TraceAccess::empty);
+            entry.insert(access);
         }
     }
 
     pub fn into_artifacts(self, resolver: &dyn PathResolver) -> Vec<TraceArtifact> {
         self.files
             .into_iter()
-            .map(|runtime_path| {
+            .map(|(runtime_path, access)| {
                 let host_path = resolver.runtime_to_host(&runtime_path);
                 let logical_path = host_path
                     .as_ref()
@@ -236,6 +244,7 @@ impl TraceReport {
                     runtime_path,
                     host_path,
                     logical_path,
+                    access,
                 }
             })
             .collect()
@@ -245,6 +254,7 @@ impl TraceReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn report_dedup() {
@@ -252,6 +262,16 @@ mod tests {
         report.record_path(PathBuf::from("/tmp/a"));
         report.record_path(PathBuf::from("/tmp/a"));
         assert_eq!(report.files.len(), 1);
+    }
+
+    #[test]
+    fn report_merges_access_kinds() {
+        let mut report = TraceReport::default();
+        report.record_path_with_access(PathBuf::from("/tmp/a"), TraceAccess::OPEN);
+        report.record_path_with_access(PathBuf::from("/tmp/a"), TraceAccess::LINK);
+        let access = report.files.get(Path::new("/tmp/a")).copied().unwrap();
+        assert!(access.contains(TraceAccess::OPEN));
+        assert!(access.contains(TraceAccess::LINK));
     }
 }
 

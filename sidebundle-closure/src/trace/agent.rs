@@ -1,6 +1,6 @@
 use crate::trace::{TraceBackend, TraceError, TraceInvocation, TraceReport};
 use serde::{Deserialize, Serialize};
-use sidebundle_core::RuntimeMetadata;
+use sidebundle_core::{RuntimeMetadata, TraceAccess};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// Current schema version for trace specs exchanged with container agents.
 pub const TRACE_SPEC_VERSION: u32 = 1;
 /// Current schema version for reports emitted by container agents.
-pub const TRACE_REPORT_VERSION: u32 = 1;
+pub const TRACE_REPORT_VERSION: u32 = 2;
 
 /// Serializable specification describing commands the agent must trace.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,16 +56,22 @@ pub struct TraceLimits {
 pub struct TraceSpecReport {
     pub schema_version: u32,
     #[serde(default)]
-    pub files: Vec<PathBuf>,
+    pub files: Vec<TraceSpecRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<RuntimeMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceSpecRecord {
+    pub path: PathBuf,
+    pub access: TraceAccess,
 }
 
 impl TraceSpecReport {
     pub fn into_runtime_report(self) -> TraceReport {
         let mut report = TraceReport::default();
-        for path in self.files {
-            report.record_path(path);
+        for record in self.files {
+            report.record_path_with_access(record.path, record.access);
         }
         report
     }
