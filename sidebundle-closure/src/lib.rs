@@ -404,7 +404,7 @@ impl ClosureBuilder {
                                     self.make_trace_artifact(resolver.as_ref(), &record)
                                 {
                                     origin_map
-                                        .entry(artifact.resolved.clone())
+                                        .entry(artifact.original.clone())
                                         .or_insert(artifact);
                                 }
                             }
@@ -441,7 +441,9 @@ impl ClosureBuilder {
                         access: record.access,
                     };
                     if let Some(traced) = self.make_trace_artifact(resolver.as_ref(), &artifact) {
-                        origin_map.entry(traced.resolved.clone()).or_insert(traced);
+                        origin_map
+                            .entry(traced.original.clone())
+                            .or_insert(traced);
                     }
                 }
             }
