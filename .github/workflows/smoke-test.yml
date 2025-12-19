@@ -42,6 +42,7 @@ jobs:
               echo "Building sidebundle-cli (logs: /github/workspace/target/cargo-build.log)"
               cargo build --release -p sidebundle-cli >/github/workspace/target/cargo-build.log 2>&1
               SB_TRACE_BACKEND=combined SB_LOG_LEVEL=info scripts/bwrap_smoke.sh
+              bash scripts/ptrace_child_probe_smoke.sh
             '
 
       - name: Verify bwrap bundles on different base image

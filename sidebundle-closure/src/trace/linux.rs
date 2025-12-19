@@ -8,7 +8,7 @@ use nix::sys::ptrace::AddressType;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, chroot, execve, fork, ForkResult, Pid};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, CString, OsString};
 use std::fs;
@@ -222,20 +222,29 @@ unsafe fn fanotify_child_main(root: Option<&Path>, argv: &[CString], envp: &[CSt
 
 unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
     let mut report = TraceReport::default();
+    let root = child;
+    let mut tracker = TraceeTracker::new(root);
     let mut entering: HashMap<Pid, bool> = HashMap::new();
     let mut pending: HashMap<Pid, PendingSyscall> = HashMap::new();
 
+    fn ensure_options(pid: Pid) -> Result<(), TraceError> {
+        match ptrace::setoptions(pid, ptrace_default_options()) {
+            Ok(()) => Ok(()),
+            Err(Errno::ESRCH) => Ok(()),
+            Err(err) => Err(TraceError::Nix(err)),
+        }
+    }
+
     loop {
-        match waitpid(Some(child), Some(WaitPidFlag::empty())) {
+        match waitpid(None, Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::Stopped(pid, Signal::SIGSTOP)) => {
-                ptrace::setoptions(
-                    pid,
-                    ptrace::Options::PTRACE_O_TRACESYSGOOD | ptrace::Options::PTRACE_O_TRACEEXIT,
-                )
-                .map_err(TraceError::Nix)?;
+                tracker.ensure_tracee(pid);
+                entering.entry(pid).or_insert(true);
+                ensure_options(pid)?;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
             Ok(WaitStatus::PtraceSyscall(pid)) => {
+                tracker.ensure_tracee(pid);
                 let entry = entering.entry(pid).or_insert(true);
                 if let Err(err) = handle_syscall(pid, *entry, &mut pending, &mut report) {
                     ptrace::detach(pid, None).ok();
@@ -244,35 +253,126 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
                 *entry = !*entry;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
-            Ok(WaitStatus::PtraceEvent(pid, _, _)) => {
+            Ok(WaitStatus::PtraceEvent(pid, _, event)) => {
+                tracker.ensure_tracee(pid);
+                ensure_options(pid)?;
+                if event == libc::PTRACE_EVENT_FORK || event == libc::PTRACE_EVENT_VFORK {
+                    if let Ok(raw) = ptrace::getevent(pid) {
+                        let new_pid = Pid::from_raw(raw as i32);
+                        tracker.ensure_tracee(new_pid);
+                        entering.entry(new_pid).or_insert(true);
+                        // Some environments do not reliably auto-attach to new tracees for
+                        // fork/vfork events. Best-effort attach makes child-following robust.
+                        match ptrace::attach(new_pid) {
+                            Ok(()) => {
+                                // Wait for the initial stop, configure, and resume.
+                                let _ = waitpid(
+                                    new_pid,
+                                    Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED),
+                                );
+                                ensure_options(new_pid)?;
+                                ptrace::syscall(new_pid, None).map_err(TraceError::Nix)?;
+                            }
+                            Err(Errno::EPERM) | Err(Errno::EBUSY) | Err(Errno::ESRCH) => {}
+                            Err(err) => return Err(TraceError::Nix(err)),
+                        }
+                    }
+                }
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
             Ok(WaitStatus::Exited(pid, status)) => {
-                if pid == child {
-                    return match TraceExit::from_status(status) {
-                        Some(exit) => Err(map_trace_exit(exit)),
+                tracker.on_exit(pid, Some(status));
+                entering.remove(&pid);
+                pending.remove(&pid);
+                if tracker.is_done() {
+                    return match tracker.root_status() {
+                        Some(status) => match TraceExit::from_status(status) {
+                            Some(exit) => Err(map_trace_exit(exit)),
+                            None => Ok(report),
+                        },
                         None => Ok(report),
                     };
                 }
             }
             Ok(WaitStatus::Signaled(pid, _sig, _)) => {
-                if pid == child {
-                    return Err(TraceError::UnexpectedExit);
+                tracker.on_exit(pid, None);
+                entering.remove(&pid);
+                pending.remove(&pid);
+                if tracker.is_done() {
+                    if pid == root {
+                        return Err(TraceError::UnexpectedExit);
+                    }
+                    return Ok(report);
                 }
             }
             Ok(WaitStatus::StillAlive) => {}
             Ok(WaitStatus::Continued(_)) => {}
             Ok(WaitStatus::Stopped(pid, _)) => {
+                tracker.ensure_tracee(pid);
+                entering.entry(pid).or_insert(true);
+                ensure_options(pid)?;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
             Err(err) => {
                 if let nix::errno::Errno::ECHILD = err {
-                    return Ok(report);
+                    return match tracker.root_status() {
+                        Some(status) => match TraceExit::from_status(status) {
+                            Some(exit) => Err(map_trace_exit(exit)),
+                            None => Ok(report),
+                        },
+                        None => Ok(report),
+                    };
                 } else {
                     return Err(TraceError::Nix(err));
                 }
             }
         }
+    }
+}
+
+fn ptrace_default_options() -> ptrace::Options {
+    ptrace::Options::PTRACE_O_TRACESYSGOOD
+        | ptrace::Options::PTRACE_O_TRACEEXIT
+        | ptrace::Options::PTRACE_O_TRACEFORK
+        | ptrace::Options::PTRACE_O_TRACEVFORK
+        | ptrace::Options::PTRACE_O_TRACEEXEC
+}
+
+#[derive(Debug)]
+struct TraceeTracker {
+    root: Pid,
+    tracees: HashSet<Pid>,
+    root_status: Option<i32>,
+}
+
+impl TraceeTracker {
+    fn new(root: Pid) -> Self {
+        let mut tracees = HashSet::new();
+        tracees.insert(root);
+        Self {
+            root,
+            tracees,
+            root_status: None,
+        }
+    }
+
+    fn ensure_tracee(&mut self, pid: Pid) {
+        self.tracees.insert(pid);
+    }
+
+    fn on_exit(&mut self, pid: Pid, status: Option<i32>) {
+        if pid == self.root {
+            self.root_status = status;
+        }
+        self.tracees.remove(&pid);
+    }
+
+    fn root_status(&self) -> Option<i32> {
+        self.root_status
+    }
+
+    fn is_done(&self) -> bool {
+        self.tracees.is_empty()
     }
 }
 
@@ -509,6 +609,12 @@ mod tests {
     }
 
     #[test]
+    fn ptrace_default_options_do_not_enable_traceclone() {
+        let opts = ptrace_default_options();
+        assert!(!opts.contains(ptrace::Options::PTRACE_O_TRACECLONE));
+    }
+
+    #[test]
     fn fanotify_backend_default_mask_includes_exec() {
         let backend = FanotifyBackend::new();
         assert!(backend.mask().contains(MaskFlags::FAN_OPEN_EXEC));
@@ -594,5 +700,89 @@ mod tests {
         )
         .unwrap();
         assert!(report.files.contains(Path::new("encodings/__init__.py")));
+    }
+
+    #[test]
+    fn tracee_tracker_adds_and_removes_pids_until_done() {
+        let root = Pid::from_raw(1);
+        let mut tracker = TraceeTracker::new(root);
+        assert!(!tracker.is_done());
+
+        let child = Pid::from_raw(2);
+        tracker.ensure_tracee(child);
+        assert!(!tracker.is_done());
+
+        tracker.on_exit(child, Some(0));
+        assert!(!tracker.is_done());
+
+        tracker.on_exit(root, Some(0));
+        assert!(tracker.is_done());
+        assert_eq!(tracker.root_status(), Some(0));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pending_probe_syscalls_are_isolated_per_pid() {
+        let pid_a = Pid::from_raw(111);
+        let pid_b = Pid::from_raw(222);
+        let mut pending = HashMap::new();
+        let mut report = TraceReport::default();
+
+        let mut regs_a = regs_for(SYS_STATX);
+        regs_a.rdi = libc::AT_FDCWD as u64;
+        regs_a.rsi = 0x1000;
+        handle_syscall_regs(
+            pid_a,
+            true,
+            SYS_STATX,
+            &regs_a,
+            &mut pending,
+            &mut report,
+            |_| Ok("a.py".to_string()),
+        )
+        .unwrap();
+
+        let mut regs_b = regs_for(SYS_STATX);
+        regs_b.rdi = libc::AT_FDCWD as u64;
+        regs_b.rsi = 0x2000;
+        handle_syscall_regs(
+            pid_b,
+            true,
+            SYS_STATX,
+            &regs_b,
+            &mut pending,
+            &mut report,
+            |_| Ok("b.py".to_string()),
+        )
+        .unwrap();
+
+        let mut regs_exit_a = regs_for(SYS_STATX);
+        regs_exit_a.rax = 0;
+        handle_syscall_regs(
+            pid_a,
+            false,
+            SYS_STATX,
+            &regs_exit_a,
+            &mut pending,
+            &mut report,
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        assert!(report.files.contains(Path::new("a.py")));
+        assert!(!report.files.contains(Path::new("b.py")));
+
+        let mut regs_exit_b = regs_for(SYS_STATX);
+        regs_exit_b.rax = 0;
+        handle_syscall_regs(
+            pid_b,
+            false,
+            SYS_STATX,
+            &regs_exit_b,
+            &mut pending,
+            &mut report,
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        assert!(report.files.contains(Path::new("b.py")));
     }
 }
