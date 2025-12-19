@@ -641,7 +641,8 @@ impl ClosureBuilder {
         if traced.access.contains(TraceAccess::LINK) {
             return true;
         }
-        if !traced.access.contains(TraceAccess::EXEC) {
+        if !(traced.access.contains(TraceAccess::EXEC) || traced.access.contains(TraceAccess::OPEN))
+        {
             return false;
         }
         let Some(host_path) = resolver.runtime_to_host(&traced.original) else {

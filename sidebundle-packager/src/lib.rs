@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -720,7 +720,14 @@ fn traced_destination(path: &Path) -> PathBuf {
 
 fn payload_alias_destination(path: &Path) -> PathBuf {
     let mut dest = PathBuf::from("payload");
-    for component in path.components() {
+    let mut comps = path.components().peekable();
+    if matches!(comps.peek(), Some(Component::RootDir)) {
+        comps.next();
+    }
+    if matches!(comps.peek(), Some(Component::Normal(part)) if *part == OsStr::new("payload")) {
+        comps.next();
+    }
+    for component in comps {
         match component {
             Component::RootDir => {
                 dest = PathBuf::from("payload");
@@ -951,6 +958,14 @@ mod tests {
         let target_abs = Path::new("/bundle/payload/usr/lib/java/bin/java");
         let rel = relative_symlink_target(dest_parent, target_abs);
         assert_eq!(rel, PathBuf::from("../lib/java/bin/java"));
+    }
+
+    #[test]
+    fn payload_alias_destination_strips_payload_prefix() {
+        let dest = payload_alias_destination(Path::new("/payload/lib64/ld-linux-x86-64.so.2"));
+        assert_eq!(dest, PathBuf::from("payload/lib64/ld-linux-x86-64.so.2"));
+        let rel = payload_alias_destination(Path::new("payload/usr/bin/java"));
+        assert_eq!(rel, PathBuf::from("payload/usr/bin/java"));
     }
 
     #[test]
