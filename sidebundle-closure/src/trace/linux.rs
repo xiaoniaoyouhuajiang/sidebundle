@@ -1,4 +1,5 @@
 use super::{TraceBackend, TraceError, TraceInvocation, TraceReport};
+use log::debug;
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
@@ -237,6 +238,17 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
         }
     }
 
+    fn resume_new_tracee(pid: Pid) -> Result<(), TraceError> {
+        // Best-effort: the new thread/process should be in a stopped state.
+        let _ = waitpid(pid, Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED));
+        ensure_options(pid)?;
+        match ptrace::syscall(pid, None) {
+            Ok(()) => Ok(()),
+            Err(Errno::ESRCH) => Ok(()),
+            Err(err) => Err(TraceError::Nix(err)),
+        }
+    }
+
     loop {
         match waitpid(None, Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::Stopped(pid, Signal::SIGSTOP)) => {
@@ -258,25 +270,40 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             Ok(WaitStatus::PtraceEvent(pid, _, event)) => {
                 tracker.ensure_tracee(pid);
                 ensure_options(pid)?;
-                if event == libc::PTRACE_EVENT_FORK || event == libc::PTRACE_EVENT_VFORK {
+                if event == libc::PTRACE_EVENT_FORK
+                    || event == libc::PTRACE_EVENT_VFORK
+                    || event == libc::PTRACE_EVENT_CLONE
+                {
                     if let Ok(raw) = ptrace::getevent(pid) {
                         let new_pid = Pid::from_raw(raw as i32);
                         tracker.ensure_tracee(new_pid);
                         entering.entry(new_pid).or_insert(true);
-                        // Some environments do not reliably auto-attach to new tracees for
-                        // fork/vfork events. Best-effort attach makes child-following robust.
-                        match ptrace::attach(new_pid) {
-                            Ok(()) => {
-                                // Wait for the initial stop, configure, and resume.
-                                let _ = waitpid(
-                                    new_pid,
-                                    Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED),
-                                );
-                                ensure_options(new_pid)?;
-                                ptrace::syscall(new_pid, None).map_err(TraceError::Nix)?;
+                        let event_name = if event == libc::PTRACE_EVENT_CLONE {
+                            "clone"
+                        } else if event == libc::PTRACE_EVENT_VFORK {
+                            "vfork"
+                        } else {
+                            "fork"
+                        };
+                        debug!(
+                            "ptrace: traced {} created new {} {}",
+                            pid.as_raw(),
+                            event_name,
+                            new_pid.as_raw()
+                        );
+                        if event != libc::PTRACE_EVENT_CLONE {
+                            // Some environments do not reliably auto-attach to new tracees for
+                            // fork/vfork events. Best-effort attach makes child-following robust.
+                            match ptrace::attach(new_pid) {
+                                Ok(()) => {
+                                    resume_new_tracee(new_pid)?;
+                                }
+                                Err(Errno::EPERM) | Err(Errno::EBUSY) | Err(Errno::ESRCH) => {}
+                                Err(err) => return Err(TraceError::Nix(err)),
                             }
-                            Err(Errno::EPERM) | Err(Errno::EBUSY) | Err(Errno::ESRCH) => {}
-                            Err(err) => return Err(TraceError::Nix(err)),
+                        } else {
+                            // Threads are auto-attached; we still need to resume them.
+                            resume_new_tracee(new_pid)?;
                         }
                     }
                 }
@@ -309,11 +336,15 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             }
             Ok(WaitStatus::StillAlive) => {}
             Ok(WaitStatus::Continued(_)) => {}
-            Ok(WaitStatus::Stopped(pid, _)) => {
+            Ok(WaitStatus::Stopped(pid, sig)) => {
                 tracker.ensure_tracee(pid);
                 entering.entry(pid).or_insert(true);
                 ensure_options(pid)?;
-                ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
+                let mut forward = None;
+                if sig != Signal::SIGTRAP && sig != Signal::SIGSTOP {
+                    forward = Some(sig);
+                }
+                ptrace::syscall(pid, forward).map_err(TraceError::Nix)?;
             }
             Err(err) => {
                 if let nix::errno::Errno::ECHILD = err {
@@ -337,6 +368,7 @@ fn ptrace_default_options() -> ptrace::Options {
         | ptrace::Options::PTRACE_O_TRACEEXIT
         | ptrace::Options::PTRACE_O_TRACEFORK
         | ptrace::Options::PTRACE_O_TRACEVFORK
+        | ptrace::Options::PTRACE_O_TRACECLONE
         | ptrace::Options::PTRACE_O_TRACEEXEC
 }
 
@@ -635,9 +667,9 @@ mod tests {
     }
 
     #[test]
-    fn ptrace_default_options_do_not_enable_traceclone() {
+    fn ptrace_default_options_enable_traceclone() {
         let opts = ptrace_default_options();
-        assert!(!opts.contains(ptrace::Options::PTRACE_O_TRACECLONE));
+        assert!(opts.contains(ptrace::Options::PTRACE_O_TRACECLONE));
     }
 
     #[test]

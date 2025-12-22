@@ -284,6 +284,14 @@ if [[ -n "$java_bin" ]]; then
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND" \
     "${copy_args[@]}"
+  if [[ "$TRACE_BACKEND" == "ptrace" || "$TRACE_BACKEND" == "combined" ]]; then
+    manifest="$java_out/manifest.lock"
+    trace_dest="resources/traced${java_home}/conf/security/java.security"
+    if [[ -f "$manifest" ]] && ! grep -q "\"destination\": \"$trace_dest\"" "$manifest"; then
+      echo "java security trace regression failed: $trace_dest not present in manifest" >&2
+      exit 1
+    fi
+  fi
   echo "find libstdc++ in bundle (java):"
   find "$java_out/payload" -maxdepth 4 -name 'libstdc++.so*' -type f -print || true
   echo "ldd on bundled java (host perspective):"
@@ -309,6 +317,33 @@ EOF
   fi
 else
   echo "java not found; skipping java test"
+fi
+
+# Demo one-stop script (Python + Java + Node)
+demo_script="$ROOT/scripts/demo_one_stop.sh"
+demo_py="/home/user/.pyenv/versions/3.12.11/bin/python3.12"
+demo_node="/home/user/.nvm/versions/node/v20.5.1/bin/node"
+demo_java="/usr/bin/java"
+demo_src="$ROOT/scripts/HelloSidebundle.java"
+if [[ -x "$demo_script" ]]; then
+  if [[ -x "$demo_py" && -x "$demo_node" && -x "$demo_java" && -f "$demo_src" ]]; then
+    demo_out="$OUT/all-in-one"
+    resolved_demo_java="$(readlink -f "$demo_java")"
+    demo_java_home="$(dirname "$(dirname "$resolved_demo_java")")"
+    demo_java_ld_path="${demo_java_home}/lib/jli:${demo_java_home}/lib/server:${LD_LIBRARY_PATH:-}"
+    echo "demo one-stop trace_backend=$TRACE_BACKEND"
+    run_bundle "bundle demo one-stop" env "LD_LIBRARY_PATH=${demo_java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
+      --from-host "$demo_script" \
+      --name all-in-one \
+      --out-dir "$OUT" \
+      --run-mode bwrap \
+      --trace-backend "$TRACE_BACKEND"
+    run_bundle "run demo one-stop" "$demo_out/bin/demo_one_stop.sh"
+  else
+    echo "demo one-stop prerequisites missing; skipping (need $demo_py, $demo_node, $demo_java, $demo_src)"
+  fi
+else
+  echo "demo_one_stop.sh not found; skipping demo one-stop"
 fi
 
 # pip3 (shebang + Python runtime resources)

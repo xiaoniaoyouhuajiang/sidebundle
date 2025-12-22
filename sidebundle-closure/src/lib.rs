@@ -6,7 +6,7 @@ pub mod validator;
 use crate::image::ImageRoot;
 use log::warn;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -403,9 +403,7 @@ impl ClosureBuilder {
                                 if let Some(artifact) =
                                     self.make_trace_artifact(resolver.as_ref(), &record)
                                 {
-                                    origin_map
-                                        .entry(artifact.original.clone())
-                                        .or_insert(artifact);
+                                    Self::insert_traced_file(origin_map, artifact);
                                 }
                             }
                         }
@@ -441,9 +439,7 @@ impl ClosureBuilder {
                         access: record.access,
                     };
                     if let Some(traced) = self.make_trace_artifact(resolver.as_ref(), &artifact) {
-                        origin_map
-                            .entry(traced.original.clone())
-                            .or_insert(traced);
+                        Self::insert_traced_file(origin_map, traced);
                     }
                 }
             }
@@ -560,6 +556,18 @@ impl ClosureBuilder {
             is_elf,
             access: original.access,
         })
+    }
+
+    fn insert_traced_file(map: &mut BTreeMap<PathBuf, TracedFile>, artifact: TracedFile) {
+        match map.entry(artifact.original.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(artifact);
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.access.insert(artifact.access);
+            }
+        }
     }
 
     fn promote_traced_elves(
@@ -1627,5 +1635,24 @@ mod tests {
                 "expected bash scanner to find {expected}"
             );
         }
+    }
+
+    #[test]
+    fn traced_access_is_merged_per_runtime_path() {
+        let mut map = BTreeMap::new();
+        let base = TracedFile {
+            original: PathBuf::from("/etc/hosts"),
+            resolved: PathBuf::from("/etc/hosts"),
+            is_elf: false,
+            access: TraceAccess::OPEN,
+        };
+        ClosureBuilder::insert_traced_file(&mut map, base.clone());
+        let mut second = base;
+        second.access = TraceAccess::STAT;
+        ClosureBuilder::insert_traced_file(&mut map, second);
+
+        let merged = map.get(Path::new("/etc/hosts")).expect("merged entry");
+        assert!(merged.access.contains(TraceAccess::OPEN));
+        assert!(merged.access.contains(TraceAccess::STAT));
     }
 }
