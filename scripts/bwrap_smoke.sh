@@ -337,13 +337,22 @@ if [[ -x "$demo_script" ]]; then
     resolved_demo_java="$(readlink -f "$demo_java")"
     demo_java_home="$(dirname "$(dirname "$resolved_demo_java")")"
     demo_java_ld_path="${demo_java_home}/lib/jli:${demo_java_home}/lib/server:${LD_LIBRARY_PATH:-}"
+    demo_copy_args=()
+    demo_sec_target="$(readlink -f "$demo_java_home/conf/security/java.security" || true)"
+    demo_sec_src=""
+    demo_sec_dest="$demo_java_home/conf/security"
+    if [[ -n "$demo_sec_target" && -f "$demo_sec_target" ]]; then
+      demo_sec_src="$(dirname "$demo_sec_target")"
+    fi
+    [[ -n "$demo_sec_src" ]] && demo_copy_args+=(--copy-dir "$demo_sec_src:$demo_sec_dest")
     echo "demo one-stop trace_backend=$TRACE_BACKEND"
     run_bundle "bundle demo one-stop" env "LD_LIBRARY_PATH=${demo_java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
       --from-host "$demo_script" \
       --name all-in-one \
       --out-dir "$OUT" \
       --run-mode bwrap \
-      --trace-backend "$TRACE_BACKEND"
+      --trace-backend "$TRACE_BACKEND" \
+      "${demo_copy_args[@]}"
     run_bundle "run demo one-stop" "$demo_out/bin/demo_one_stop.sh"
   else
     echo "demo one-stop prerequisites missing; skipping (need $demo_py, $demo_node, $demo_java, $demo_src)"
