@@ -266,6 +266,12 @@ if [[ -n "$java_bin" ]]; then
     sec_src="$(dirname "$sec_target")"
   fi
   java_out="$OUT/java"
+  java_trace_arg="-version"
+  expect_java_security_trace=0
+  if [[ -f "$ROOT/scripts/HelloSidebundle.java" ]]; then
+    java_trace_arg="$ROOT/scripts/HelloSidebundle.java"
+    expect_java_security_trace=1
+  fi
   copy_args=(--copy-dir "$java_home")
   [[ -n "$sec_src" ]] && copy_args+=(--copy-dir "$sec_src:$sec_dest")
   [[ -n "$arch_lib" && -d "$arch_lib" ]] && copy_args+=(--copy-dir "$arch_lib")
@@ -278,13 +284,13 @@ if [[ -n "$java_bin" ]]; then
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
   echo "java trace_backend=$TRACE_BACKEND"
   run_bundle "bundle java" env "LD_LIBRARY_PATH=${java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
-    --from-host "$java_bin::trace=-version" \
+    --from-host "$java_bin::trace=$java_trace_arg" \
     --name java \
     --out-dir "$OUT" \
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND" \
     "${copy_args[@]}"
-  if [[ "$TRACE_BACKEND" == "ptrace" || "$TRACE_BACKEND" == "combined" ]]; then
+  if [[ $expect_java_security_trace -eq 1 && ( "$TRACE_BACKEND" == "ptrace" || "$TRACE_BACKEND" == "combined" ) ]]; then
     manifest="$java_out/manifest.lock"
     trace_dest="resources/traced${java_home}/conf/security/java.security"
     if [[ -f "$manifest" ]] && ! grep -q "\"destination\": \"$trace_dest\"" "$manifest"; then
