@@ -51,10 +51,15 @@ rm -rf "$OUT/$name"
 probe_script="$OUT/thread_probe.py"
 cat >"$probe_script" <<'PY'
 import threading
+import time
 
 def worker():
-    with open("/etc/hosts", "rb") as handle:
-        handle.read(1)
+    # Keep the thread alive briefly so ptrace can attach before openat runs.
+    time.sleep(0.2)
+    for _ in range(5):
+        with open("/etc/hosts", "rb") as handle:
+            handle.read(1)
+        time.sleep(0.05)
 
 t = threading.Thread(target=worker)
 t.start()
