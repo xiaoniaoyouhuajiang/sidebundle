@@ -32,7 +32,7 @@ jobs:
               echo "Setting up build environment (logs: $APT_LOG)"
               apt-get update -qq >>"$APT_LOG" 2>&1
               DEBIAN_FRONTEND=noninteractive apt-get install -yqq \
-                bubblewrap sudo curl build-essential \
+                bubblewrap sudo curl build-essential strace \
                 nodejs npm python3 python3-pip python3-numpy openjdk-17-jdk \
                 ca-certificates git pkg-config libssl-dev bash >>"$APT_LOG" 2>&1
               mkdir -p /home/user/.pyenv/versions/3.12.11/bin
