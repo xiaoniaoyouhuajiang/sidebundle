@@ -28,15 +28,24 @@ impl LinkerRunner {
         Self::default()
     }
 
+    fn resolve_subject(subject: &Path) -> PathBuf {
+        // Some ELF behaviors (notably $ORIGIN expansion) depend on the path used to invoke the
+        // binary. If the subject is a symlink (e.g. /usr/bin/java -> .../jvm/.../bin/java),
+        // invoking the linker with the symlink path can change $ORIGIN and break dependency
+        // tracing. Prefer the canonical target when available.
+        std::fs::canonicalize(subject).unwrap_or_else(|_| subject.to_path_buf())
+    }
+
     pub fn trace_dependencies(
         &self,
         linker: &Path,
         subject: &Path,
         search_paths: &[PathBuf],
     ) -> Result<Vec<LibraryResolution>, LinkerError> {
+        let subject = Self::resolve_subject(subject);
         let cache_key = CacheKey {
             linker: linker.to_path_buf(),
-            subject: subject.to_path_buf(),
+            subject: subject.clone(),
             search_paths: search_paths.to_vec(),
         };
 
@@ -50,7 +59,7 @@ impl LinkerRunner {
         }
 
         let mut command = Command::new(linker);
-        command.arg("--list").arg(subject);
+        command.arg("--list").arg(&subject);
         command.env("LD_TRACE_LOADED_OBJECTS", "1");
         command.env("LC_ALL", "C");
 
@@ -204,7 +213,7 @@ struct CacheKey {
 
 #[cfg(test)]
 mod tests {
-    use super::is_gcompat_stub_binary;
+    use super::{is_gcompat_stub_binary, LinkerRunner};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -235,5 +244,17 @@ mod tests {
             panic!("fixture missing: {}", fixture.display());
         }
         assert!(is_gcompat_stub_binary(&fixture).unwrap());
+    }
+
+    #[test]
+    fn resolve_subject_prefers_canonical_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::write(&target, b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolved = LinkerRunner::resolve_subject(&link);
+        assert_eq!(resolved, target);
     }
 }

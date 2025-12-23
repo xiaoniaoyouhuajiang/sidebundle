@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsString};
 use std::fmt::Write as _;
@@ -18,7 +18,7 @@ use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{
         TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand, TraceSpec,
-        TraceSpecReport, TRACE_REPORT_VERSION,
+        TraceSpecRecord, TraceSpecReport, TRACE_REPORT_VERSION,
     },
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ChrootPathResolver, ClosureBuilder, PathResolver, ResolverSet,
@@ -284,7 +284,7 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
         args.rootfs.clone(),
         Origin::Host,
     ));
-    let mut files = BTreeSet::new();
+    let mut files = BTreeMap::new();
     for command in &trace_spec.commands {
         let Some(program) = command.argv.first() else {
             continue;
@@ -298,13 +298,19 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
             .run(resolver.as_ref(), &trace_command)
             .with_context(|| format!("agent: trace invocation failed for {program}"))?;
         for artifact in artifacts {
-            files.insert(artifact.runtime_path);
+            let entry = files
+                .entry(artifact.runtime_path)
+                .or_insert_with(sidebundle_core::TraceAccess::empty);
+            entry.insert(artifact.access);
         }
     }
 
     let report = TraceSpecReport {
         schema_version: TRACE_REPORT_VERSION,
-        files: files.into_iter().collect(),
+        files: files
+            .into_iter()
+            .map(|(path, access)| sidebundle_closure::trace::TraceSpecRecord { path, access })
+            .collect(),
         metadata: Some(runtime_metadata),
     };
     let report_path = args.output.join("report.json");
@@ -1114,7 +1120,7 @@ struct BuildFromRootArgs<'a> {
     agent_launch: Option<&'a AgentLaunchConfig>,
     allow_gpu_libs: bool,
     run_mode: RunMode,
-    external_traces: Option<Vec<PathBuf>>,
+    external_traces: Option<Vec<TraceSpecRecord>>,
     metadata: Option<RuntimeMetadata>,
 }
 
@@ -1373,8 +1379,8 @@ fn build_closure_from_root(args: BuildFromRootArgs) -> Result<ImageClosureResult
     let mut builder = ClosureBuilder::new()
         .with_resolver_set(resolvers.clone())
         .with_allow_gpu_libs(allow_gpu_libs);
-    if let Some(paths) = external_traces {
-        builder = builder.with_external_trace_paths(origin.clone(), paths);
+    if let Some(records) = external_traces {
+        builder = builder.with_external_trace_records(origin.clone(), records);
     }
     if let Some(backend) =
         configure_image_trace_backend(trace_backend, backend, reference, agent_launch)?

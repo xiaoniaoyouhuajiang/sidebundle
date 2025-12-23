@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -103,6 +105,11 @@ impl Packager {
 
         let mut manifest_files = Vec::new();
         let mut alias_map: HashMap<PathBuf, Vec<PathBuf>> = closure.runtime_aliases.clone();
+        let symlink_destinations: HashSet<PathBuf> = closure
+            .symlinks
+            .iter()
+            .map(|link| link.destination.clone())
+            .collect();
         for traced in &closure.traced_files {
             alias_map
                 .entry(traced.resolved.clone())
@@ -214,6 +221,13 @@ impl Packager {
             if let Some(runtime_aliases) = alias_map.remove(&file.source) {
                 let canonical_abs = bundle_root.join(&normalized_destination);
                 for runtime in runtime_aliases {
+                    if symlink_destinations.contains(&runtime) {
+                        debug!(
+                            "packager: skipping alias {} (symlink preserved)",
+                            runtime.display()
+                        );
+                        continue;
+                    }
                     let alias_rel = payload_alias_destination(&runtime);
                     let canonical_rel = clean_relative(&canonical_abs, &bundle_root);
                     let alias_rel = normalize_payload_path(&alias_rel);
@@ -276,12 +290,7 @@ impl Packager {
         }
 
         info!(
-            "packager: alias files: {} (hardlinks={}, copies={}, logical={} bytes, allocated={} bytes)",
-            alias_file_count,
-            alias_hardlink_count,
-            alias_copy_count,
-            alias_logical_bytes,
-            alias_allocated_bytes
+            "packager: alias files: {alias_file_count} (hardlinks={alias_hardlink_count}, copies={alias_copy_count}, logical={alias_logical_bytes} bytes, allocated={alias_allocated_bytes} bytes)"
         );
 
         for (missing_source, aliases) in alias_map {
@@ -295,12 +304,65 @@ impl Packager {
             );
         }
 
+        let mut symlink_count: u64 = 0;
         for link in &closure.symlinks {
+            let dest_rel = normalize_payload_path(&payload_alias_destination(&link.destination));
+            let target_rel =
+                normalize_payload_path(&payload_alias_destination(&link.bundle_target));
+            if dest_rel == target_rel {
+                continue;
+            }
+            let dest_abs = bundle_root.join(&dest_rel);
+            let target_abs = bundle_root.join(&target_rel);
+            let Some(dest_parent) = dest_abs.parent() else {
+                continue;
+            };
+            fs::create_dir_all(dest_parent).map_err(|source| PackagerError::Io {
+                path: dest_parent.to_path_buf(),
+                source,
+            })?;
+            if dest_abs.exists() {
+                let meta = fs::symlink_metadata(&dest_abs).map_err(|source| PackagerError::Io {
+                    path: dest_abs.clone(),
+                    source,
+                })?;
+                if meta.is_dir() {
+                    warn!(
+                        "packager: symlink destination {} is a directory; skipping",
+                        dest_abs.display()
+                    );
+                    continue;
+                }
+                fs::remove_file(&dest_abs).map_err(|source| PackagerError::Io {
+                    path: dest_abs.clone(),
+                    source,
+                })?;
+            }
+            let rel_target = relative_symlink_target(dest_parent, &target_abs);
+            #[cfg(unix)]
+            {
+                symlink(&rel_target, &dest_abs).map_err(|source| PackagerError::Io {
+                    path: dest_abs.clone(),
+                    source,
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::copy(&target_abs, &dest_abs).map_err(|source| PackagerError::Io {
+                    path: dest_abs.clone(),
+                    source,
+                })?;
+                copy_permissions(&target_abs, &dest_abs).ok();
+            }
+            symlink_count = symlink_count.saturating_add(1);
             debug!(
-                "packager: ignoring symlink {} -> {} (symlink emission disabled)",
-                link.destination.display(),
-                link.bundle_target.display()
+                "packager: symlink {} -> {}",
+                dest_rel.display(),
+                rel_target.display()
             );
+        }
+        if symlink_count > 0 {
+            info!("packager: emitted {symlink_count} symlink(s)");
         }
 
         write_launchers(&bundle_root, &closure.entry_plans, &closure.metadata)?;
@@ -658,7 +720,14 @@ fn traced_destination(path: &Path) -> PathBuf {
 
 fn payload_alias_destination(path: &Path) -> PathBuf {
     let mut dest = PathBuf::from("payload");
-    for component in path.components() {
+    let mut comps = path.components().peekable();
+    if matches!(comps.peek(), Some(Component::RootDir)) {
+        comps.next();
+    }
+    if matches!(comps.peek(), Some(Component::Normal(part)) if *part == OsStr::new("payload")) {
+        comps.next();
+    }
+    for component in comps {
         match component {
             Component::RootDir => {
                 dest = PathBuf::from("payload");
@@ -674,6 +743,10 @@ fn payload_alias_destination(path: &Path) -> PathBuf {
         }
     }
     dest
+}
+
+fn relative_symlink_target(dest_parent: &Path, target_abs: &Path) -> PathBuf {
+    diff_paths(target_abs, dest_parent).unwrap_or_else(|| target_abs.to_path_buf())
 }
 
 fn collect_host_system_assets() -> HashMap<PathBuf, PathBuf> {
@@ -838,7 +911,10 @@ fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), Packager
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{BundleSpec, DependencyClosure, TargetTriple};
+    use sidebundle_core::{
+        BinaryEntryPlan, BundleSpec, DependencyClosure, EntryBundlePlan, Origin, ResolvedFile,
+        ResolvedSymlink, TargetTriple,
+    };
     use sidebundle_shim::{ShimTrailer, TRAILER_SIZE};
     use std::io::{Read, Seek, SeekFrom};
     use tempfile::tempdir;
@@ -874,5 +950,64 @@ mod tests {
         let trailer = ShimTrailer::from_bytes(&buf).expect("valid trailer");
         assert!(trailer.archive_len > 0);
         assert!(trailer.metadata_len > 0);
+    }
+
+    #[test]
+    fn relative_symlink_target_uses_parent_diff() {
+        let dest_parent = Path::new("/bundle/payload/usr/bin");
+        let target_abs = Path::new("/bundle/payload/usr/lib/java/bin/java");
+        let rel = relative_symlink_target(dest_parent, target_abs);
+        assert_eq!(rel, PathBuf::from("../lib/java/bin/java"));
+    }
+
+    #[test]
+    fn payload_alias_destination_strips_payload_prefix() {
+        let dest = payload_alias_destination(Path::new("/payload/lib64/ld-linux-x86-64.so.2"));
+        assert_eq!(dest, PathBuf::from("payload/lib64/ld-linux-x86-64.so.2"));
+        let rel = payload_alias_destination(Path::new("payload/usr/bin/java"));
+        assert_eq!(rel, PathBuf::from("payload/usr/bin/java"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn packager_emits_symlink_for_link_dependency() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("java-real");
+        fs::write(&source, b"java").unwrap();
+        let digest = compute_digest(&source).unwrap();
+
+        let mut closure = DependencyClosure::default();
+        closure.files.push(ResolvedFile::new(
+            &source,
+            "payload/usr/lib/jvm/java/bin/java",
+            &digest,
+        ));
+        closure
+            .entry_plans
+            .push(EntryBundlePlan::Binary(BinaryEntryPlan {
+                display_name: "java".to_string(),
+                binary_source: source.clone(),
+                binary_destination: PathBuf::from("payload/usr/bin/java"),
+                linker_source: source.clone(),
+                linker_destination: PathBuf::from("payload/usr/bin/java"),
+                library_dirs: Vec::new(),
+                requires_linker: false,
+                origin: Origin::Host,
+                run_mode: None,
+            }));
+        closure.symlinks.push(ResolvedSymlink::new(
+            "/usr/bin/java",
+            "/usr/lib/jvm/java/bin/java",
+        ));
+
+        let packager = Packager::new().with_output_root(root.join("out"));
+        let spec = BundleSpec::new("java", TargetTriple::linux_x86_64())
+            .with_entry(BundleSpec::host_entry("/usr/bin/java", "java"));
+        let bundle_root = packager.emit(&spec, &closure).unwrap();
+
+        let link_path = bundle_root.join("payload/usr/bin/java");
+        let target = fs::read_link(&link_path).unwrap();
+        assert_eq!(target, PathBuf::from("../lib/jvm/java/bin/java"));
     }
 }

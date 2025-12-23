@@ -437,11 +437,44 @@ impl DependencyClosure {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TraceAccess(u8);
+
+impl TraceAccess {
+    pub const OPEN: TraceAccess = TraceAccess(0b0001);
+    pub const STAT: TraceAccess = TraceAccess(0b0010);
+    pub const LINK: TraceAccess = TraceAccess(0b0100);
+    pub const EXEC: TraceAccess = TraceAccess(0b1000);
+
+    pub const fn empty() -> TraceAccess {
+        TraceAccess(0)
+    }
+
+    pub fn contains(self, other: TraceAccess) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub fn insert(&mut self, other: TraceAccess) {
+        self.0 |= other.0;
+    }
+
+    pub fn union(self, other: TraceAccess) -> TraceAccess {
+        TraceAccess(self.0 | other.0)
+    }
+}
+
+impl Default for TraceAccess {
+    fn default() -> Self {
+        TraceAccess::empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TracedFile {
     pub original: PathBuf,
     pub resolved: PathBuf,
     pub is_elf: bool,
+    pub access: TraceAccess,
 }
 
 #[derive(Debug, Default)]
@@ -487,6 +520,7 @@ mod tests {
                 original: PathBuf::from("/etc/ssl/cert.pem"),
                 resolved: PathBuf::from("/etc/ssl/cert.pem"),
                 is_elf: false,
+                access: TraceAccess::OPEN,
             }],
             runtime_aliases: HashMap::new(),
             symlinks: Vec::new(),
@@ -504,11 +538,13 @@ mod tests {
                     original: PathBuf::from("/etc/ssl/cert.pem"),
                     resolved: PathBuf::from("/etc/ssl/cert.pem"),
                     is_elf: false,
+                    access: TraceAccess::OPEN,
                 },
                 TracedFile {
                     original: PathBuf::from("/tmp/runtime"),
                     resolved: PathBuf::from("/tmp/runtime"),
                     is_elf: false,
+                    access: TraceAccess::OPEN,
                 },
             ],
             runtime_aliases: HashMap::new(),

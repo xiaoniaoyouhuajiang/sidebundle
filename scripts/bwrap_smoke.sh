@@ -266,6 +266,12 @@ if [[ -n "$java_bin" ]]; then
     sec_src="$(dirname "$sec_target")"
   fi
   java_out="$OUT/java"
+  java_trace_arg="-version"
+  expect_java_security_trace=0
+  if [[ -f "$ROOT/scripts/HelloSidebundle.java" ]]; then
+    java_trace_arg="$ROOT/scripts/HelloSidebundle.java"
+    expect_java_security_trace=1
+  fi
   copy_args=(--copy-dir "$java_home")
   [[ -n "$sec_src" ]] && copy_args+=(--copy-dir "$sec_src:$sec_dest")
   [[ -n "$arch_lib" && -d "$arch_lib" ]] && copy_args+=(--copy-dir "$arch_lib")
@@ -278,12 +284,20 @@ if [[ -n "$java_bin" ]]; then
   echo "java resolved: java_bin=$java_bin java_home=$java_home arch_lib=$arch_lib arch_root_lib=$arch_root_lib symlinks=${arch_symlinks[*]}"
   echo "java trace_backend=$TRACE_BACKEND"
   run_bundle "bundle java" env "LD_LIBRARY_PATH=${java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
-    --from-host "$java_bin::trace=-version" \
+    --from-host "$java_bin::trace=$java_trace_arg" \
     --name java \
     --out-dir "$OUT" \
     --run-mode bwrap \
     --trace-backend "$TRACE_BACKEND" \
     "${copy_args[@]}"
+  if [[ $expect_java_security_trace -eq 1 && ( "$TRACE_BACKEND" == "ptrace" || "$TRACE_BACKEND" == "combined" ) ]]; then
+    manifest="$java_out/manifest.lock"
+    trace_dest="resources/traced${java_home}/conf/security/java.security"
+    if [[ -f "$manifest" ]] && ! grep -q "\"destination\": \"$trace_dest\"" "$manifest"; then
+      echo "java security trace regression failed: $trace_dest not present in manifest" >&2
+      exit 1
+    fi
+  fi
   echo "find libstdc++ in bundle (java):"
   find "$java_out/payload" -maxdepth 4 -name 'libstdc++.so*' -type f -print || true
   echo "ldd on bundled java (host perspective):"
@@ -309,6 +323,42 @@ EOF
   fi
 else
   echo "java not found; skipping java test"
+fi
+
+# Demo one-stop script (Python + Java + Node)
+demo_script="$ROOT/scripts/demo_one_stop.sh"
+demo_py="/home/user/.pyenv/versions/3.12.11/bin/python3.12"
+demo_node="/home/user/.nvm/versions/node/v20.5.1/bin/node"
+demo_java="/usr/bin/java"
+demo_src="$ROOT/scripts/HelloSidebundle.java"
+if [[ -x "$demo_script" ]]; then
+  if [[ -x "$demo_py" && -x "$demo_node" && -x "$demo_java" && -f "$demo_src" ]]; then
+    demo_out="$OUT/all-in-one"
+    resolved_demo_java="$(readlink -f "$demo_java")"
+    demo_java_home="$(dirname "$(dirname "$resolved_demo_java")")"
+    demo_java_ld_path="${demo_java_home}/lib/jli:${demo_java_home}/lib/server:${LD_LIBRARY_PATH:-}"
+    demo_copy_args=()
+    demo_sec_target="$(readlink -f "$demo_java_home/conf/security/java.security" || true)"
+    demo_sec_src=""
+    demo_sec_dest="$demo_java_home/conf/security"
+    if [[ -n "$demo_sec_target" && -f "$demo_sec_target" ]]; then
+      demo_sec_src="$(dirname "$demo_sec_target")"
+    fi
+    [[ -n "$demo_sec_src" ]] && demo_copy_args+=(--copy-dir "$demo_sec_src:$demo_sec_dest")
+    echo "demo one-stop trace_backend=$TRACE_BACKEND"
+    run_bundle "bundle demo one-stop" env "LD_LIBRARY_PATH=${demo_java_ld_path}" "$cli" --log-level "$LOG_LEVEL" create \
+      --from-host "$demo_script" \
+      --name all-in-one \
+      --out-dir "$OUT" \
+      --run-mode bwrap \
+      --trace-backend "$TRACE_BACKEND" \
+      "${demo_copy_args[@]}"
+    run_bundle "run demo one-stop" "$demo_out/bin/demo_one_stop.sh"
+  else
+    echo "demo one-stop prerequisites missing; skipping (need $demo_py, $demo_node, $demo_java, $demo_src)"
+  fi
+else
+  echo "demo_one_stop.sh not found; skipping demo one-stop"
 fi
 
 # pip3 (shebang + Python runtime resources)

@@ -6,7 +6,7 @@ pub mod validator;
 use crate::image::ImageRoot;
 use log::warn;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -19,7 +19,8 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use sidebundle_core::{
     parse_elf_metadata, BinaryEntryPlan, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata,
-    ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ScriptEntryPlan, TracedFile,
+    ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ResolvedSymlink,
+    ScriptEntryPlan, TraceAccess, TracedFile,
 };
 use thiserror::Error;
 const DEFAULT_LIBRARY_DIRS: &[&str] = &[
@@ -286,7 +287,7 @@ pub struct ClosureBuilder {
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     resolvers: ResolverSet,
-    external_traces: HashMap<Origin, Vec<PathBuf>>,
+    external_traces: HashMap<Origin, Vec<trace::TraceSpecRecord>>,
 }
 
 impl ClosureBuilder {
@@ -339,10 +340,29 @@ impl ClosureBuilder {
     }
 
     pub fn with_external_trace_paths(mut self, origin: Origin, paths: Vec<PathBuf>) -> Self {
+        let records = paths
+            .into_iter()
+            .map(|path| trace::TraceSpecRecord {
+                path,
+                access: TraceAccess::OPEN,
+            })
+            .collect::<Vec<_>>();
         self.external_traces
             .entry(origin)
             .or_default()
-            .extend(paths);
+            .extend(records);
+        self
+    }
+
+    pub fn with_external_trace_records(
+        mut self,
+        origin: Origin,
+        records: Vec<trace::TraceSpecRecord>,
+    ) -> Self {
+        self.external_traces
+            .entry(origin)
+            .or_default()
+            .extend(records);
         self
     }
 
@@ -358,6 +378,7 @@ impl ClosureBuilder {
         let mut traced_map: HashMap<Origin, BTreeMap<PathBuf, TracedFile>> = HashMap::new();
         let mut elf_cache: HashMap<PathBuf, ElfMetadata> = HashMap::new();
         let mut traced_files_acc: Vec<TracedFile> = Vec::new();
+        let mut symlinks: Vec<ResolvedSymlink> = Vec::new();
 
         for entry in spec.entries() {
             let resolver = self.resolver_for(entry.logical.origin())?;
@@ -379,10 +400,10 @@ impl ClosureBuilder {
                             let origin = plan.origin().clone();
                             let origin_map = traced_map.entry(origin).or_default();
                             for record in artifacts {
-                                if let Some(artifact) = self.make_trace_artifact(&record) {
-                                    origin_map
-                                        .entry(artifact.resolved.clone())
-                                        .or_insert(artifact);
+                                if let Some(artifact) =
+                                    self.make_trace_artifact(resolver.as_ref(), &record)
+                                {
+                                    Self::insert_traced_file(origin_map, artifact);
                                 }
                             }
                         }
@@ -399,25 +420,26 @@ impl ClosureBuilder {
         for (origin, runtime_paths) in &self.external_traces {
             let resolver = self.resolver_for(origin)?;
             let origin_map = traced_map.entry(origin.clone()).or_default();
-            for runtime_path in runtime_paths {
-                if let Some(host_path) = resolver.runtime_to_host(runtime_path) {
+            for record in runtime_paths {
+                if let Some(host_path) = resolver.runtime_to_host(&record.path) {
                     let canonical_host = match canonicalize(&host_path, resolver.trace_root()) {
                         Ok(path) => path,
                         Err(err) => {
                             warn!(
                                 "skipping traced path {}: failed to canonicalize ({err})",
-                                runtime_path.display()
+                                record.path.display()
                             );
                             continue;
                         }
                     };
                     let artifact = trace::TraceArtifact {
-                        runtime_path: runtime_path.clone(),
+                        runtime_path: record.path.clone(),
                         host_path: Some(canonical_host.clone()),
-                        logical_path: Some(LogicalPath::new(origin.clone(), runtime_path.clone())),
+                        logical_path: Some(LogicalPath::new(origin.clone(), record.path.clone())),
+                        access: record.access,
                     };
-                    if let Some(traced) = self.make_trace_artifact(&artifact) {
-                        origin_map.entry(traced.resolved.clone()).or_insert(traced);
+                    if let Some(traced) = self.make_trace_artifact(resolver.as_ref(), &artifact) {
+                        Self::insert_traced_file(origin_map, traced);
                     }
                 }
             }
@@ -440,6 +462,7 @@ impl ClosureBuilder {
                 &mut runtime_aliases,
                 &traced_files,
             );
+            self.record_traced_symlinks(resolver.as_ref(), &mut symlinks, &traced_files);
             traced_files_acc.extend(traced_files);
         }
 
@@ -479,7 +502,7 @@ impl ClosureBuilder {
             entry_plans,
             traced_files: traced_files_acc,
             runtime_aliases,
-            symlinks: Vec::new(),
+            symlinks,
             metadata: HashMap::new(),
         })
     }
@@ -500,7 +523,11 @@ impl ClosureBuilder {
         canonicalize(&resolver.to_host(logical), resolver.trace_root())
     }
 
-    fn make_trace_artifact(&self, original: &trace::TraceArtifact) -> Option<TracedFile> {
+    fn make_trace_artifact(
+        &self,
+        resolver: &dyn PathResolver,
+        original: &trace::TraceArtifact,
+    ) -> Option<TracedFile> {
         let resolved = original.host_path.as_ref()?;
         if !trace_path_allowed(resolved) {
             return None;
@@ -512,13 +539,35 @@ impl ClosureBuilder {
             );
             return None;
         }
-        let host_path = resolved.clone();
+        let host_path = match canonicalize(resolved, resolver.trace_root()) {
+            Ok(path) => path,
+            Err(err) => {
+                warn!(
+                    "skipping traced artifact {}: failed to canonicalize ({err})",
+                    resolved.display()
+                );
+                return None;
+            }
+        };
         let is_elf = parse_elf_metadata(&host_path).is_ok();
         Some(TracedFile {
             original: original.runtime_path.clone(),
             resolved: host_path,
             is_elf,
+            access: original.access,
         })
+    }
+
+    fn insert_traced_file(map: &mut BTreeMap<PathBuf, TracedFile>, artifact: TracedFile) {
+        match map.entry(artifact.original.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(artifact);
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.access.insert(artifact.access);
+            }
+        }
     }
 
     fn promote_traced_elves(
@@ -570,6 +619,48 @@ impl ClosureBuilder {
                 continue;
             }
             let _ = ensure_file(resolver, files, aliases, source, Some(&artifact.original));
+        }
+    }
+
+    fn record_traced_symlinks(
+        &self,
+        resolver: &dyn PathResolver,
+        symlinks: &mut Vec<ResolvedSymlink>,
+        traced: &[TracedFile],
+    ) {
+        let mut seen: HashSet<(PathBuf, PathBuf)> = HashSet::new();
+        for artifact in traced {
+            if !self.should_preserve_symlink(resolver, artifact) {
+                continue;
+            }
+            let Some(target_logical) = resolver.host_to_logical(&artifact.resolved) else {
+                continue;
+            };
+            let destination = artifact.original.clone();
+            let bundle_target = target_logical.path().to_path_buf();
+            if destination == bundle_target {
+                continue;
+            }
+            if seen.insert((destination.clone(), bundle_target.clone())) {
+                symlinks.push(ResolvedSymlink::new(destination, bundle_target));
+            }
+        }
+    }
+
+    fn should_preserve_symlink(&self, resolver: &dyn PathResolver, traced: &TracedFile) -> bool {
+        if traced.access.contains(TraceAccess::LINK) {
+            return true;
+        }
+        if !(traced.access.contains(TraceAccess::EXEC) || traced.access.contains(TraceAccess::OPEN))
+        {
+            return false;
+        }
+        let Some(host_path) = resolver.runtime_to_host(&traced.original) else {
+            return false;
+        };
+        match fs::symlink_metadata(&host_path) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(_) => false,
         }
     }
 
@@ -1544,5 +1635,24 @@ mod tests {
                 "expected bash scanner to find {expected}"
             );
         }
+    }
+
+    #[test]
+    fn traced_access_is_merged_per_runtime_path() {
+        let mut map = BTreeMap::new();
+        let base = TracedFile {
+            original: PathBuf::from("/etc/hosts"),
+            resolved: PathBuf::from("/etc/hosts"),
+            is_elf: false,
+            access: TraceAccess::OPEN,
+        };
+        ClosureBuilder::insert_traced_file(&mut map, base.clone());
+        let mut second = base;
+        second.access = TraceAccess::STAT;
+        ClosureBuilder::insert_traced_file(&mut map, second);
+
+        let merged = map.get(Path::new("/etc/hosts")).expect("merged entry");
+        assert!(merged.access.contains(TraceAccess::OPEN));
+        assert!(merged.access.contains(TraceAccess::STAT));
     }
 }
