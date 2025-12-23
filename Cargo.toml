@@ -12,5 +12,5 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-version = "0.2.2"
+version = "0.3.0"
 authors = ["Sidecars Bundler Team"]

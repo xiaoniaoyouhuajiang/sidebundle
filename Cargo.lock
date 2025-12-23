@@ -1270,7 +1270,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sidebundle-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "sidebundle-closure"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bollard",
  "bytes",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "sidebundle-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "goblin",
  "serde",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "sidebundle-launcher"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "sidebundle-packager"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "log",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "sidebundle-shim"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flate2",
