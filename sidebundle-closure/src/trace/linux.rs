@@ -260,6 +260,11 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             Ok(WaitStatus::PtraceSyscall(pid)) => {
                 tracker.ensure_tracee(pid);
                 let entry = entering.entry(pid).or_insert(true);
+                debug!(
+                    "ptrace: syscall stop pid={} entering={}",
+                    pid.as_raw(),
+                    *entry
+                );
                 if let Err(err) = handle_syscall(pid, *entry, &mut pending, &mut report) {
                     ptrace::detach(pid, None).ok();
                     return Err(err);
