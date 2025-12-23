@@ -573,7 +573,22 @@ fn handle_syscall_regs(
         if path.is_empty() {
             return Ok(());
         }
+        debug!(
+            "ptrace: path pid={} syscall={} dirfd={} is_at={} path={}",
+            pid.as_raw(),
+            syscall_name(syscall),
+            dirfd,
+            is_at,
+            path
+        );
         if is_at && !should_record_at_path(dirfd, &path) {
+            debug!(
+                "ptrace: skip path pid={} syscall={} dirfd={} path={}",
+                pid.as_raw(),
+                syscall_name(syscall),
+                dirfd,
+                path
+            );
             return Ok(());
         }
         pending.insert(pid, PendingSyscall { path, access });
@@ -584,6 +599,12 @@ fn handle_syscall_regs(
     if let Some(p) = pending.remove(&pid) {
         let ret = regs.rax as i64;
         if ret >= 0 {
+            debug!(
+                "ptrace: record pid={} path={} access={:?}",
+                pid.as_raw(),
+                p.path,
+                p.access
+            );
             report.record_path_with_access(PathBuf::from(p.path), p.access);
         }
     }
@@ -608,6 +629,24 @@ fn should_record_at_path(dirfd: i64, path: &str) -> bool {
         return true;
     }
     dirfd == libc::AT_FDCWD as i64
+}
+
+#[cfg(target_arch = "x86_64")]
+fn syscall_name(syscall: i64) -> &'static str {
+    match syscall {
+        libc::SYS_open => "open",
+        libc::SYS_stat => "stat",
+        libc::SYS_lstat => "lstat",
+        libc::SYS_readlink => "readlink",
+        libc::SYS_openat => "openat",
+        libc::SYS_newfstatat => "newfstatat",
+        libc::SYS_readlinkat => "readlinkat",
+        SYS_STATX => "statx",
+        SYS_OPENAT2 => "openat2",
+        SYS_FACCESSAT2 => "faccessat2",
+        libc::SYS_execve => "execve",
+        _ => "unknown",
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
