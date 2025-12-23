@@ -291,19 +291,17 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
                             event_name,
                             new_pid.as_raw()
                         );
-                        if event != libc::PTRACE_EVENT_CLONE {
-                            // Some environments do not reliably auto-attach to new tracees for
-                            // fork/vfork events. Best-effort attach makes child-following robust.
-                            match ptrace::attach(new_pid) {
-                                Ok(()) => {
-                                    resume_new_tracee(new_pid)?;
-                                }
-                                Err(Errno::EPERM) | Err(Errno::EBUSY) | Err(Errno::ESRCH) => {}
-                                Err(err) => return Err(TraceError::Nix(err)),
+                        // Some environments do not reliably auto-attach to new tracees for
+                        // fork/vfork/clone events. Best-effort attach makes child-following
+                        // robust, and we ignore EPERM/EBUSY/ESRCH if the kernel already attached.
+                        match ptrace::attach(new_pid) {
+                            Ok(()) => {
+                                resume_new_tracee(new_pid)?;
                             }
-                        } else {
-                            // Threads are auto-attached; we still need to resume them.
-                            resume_new_tracee(new_pid)?;
+                            Err(Errno::EPERM) | Err(Errno::EBUSY) | Err(Errno::ESRCH) => {
+                                resume_new_tracee(new_pid)?;
+                            }
+                            Err(err) => return Err(TraceError::Nix(err)),
                         }
                     }
                 }

@@ -66,18 +66,6 @@ t.start()
 t.join()
 PY
 
-# Capture syscall shape to diagnose openat(dirfd) behavior in CI.
-strace_log="$OUT/ptrace-thread-probe-strace.log"
-if command -v strace >/dev/null 2>&1; then
-  strace -f -s 256 -e trace=open,openat,openat2,stat,statx,readlink \
-    -o "$strace_log" \
-    python3 "$probe_script" || true
-  echo "ptrace thread probe strace log: $strace_log"
-  grep -n -E "openat|/etc/hosts|hosts" "$strace_log" | tail -n 50 || true
-else
-  echo "strace not found; skipping syscall capture"
-fi
-
 # This probes a file from a worker thread. Without ptrace thread-following, the
 # open() happens in a different tid and will be missed by the tracer.
 "$cli" --log-level "$LOG_LEVEL" create \
