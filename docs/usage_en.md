@@ -13,6 +13,17 @@ bundle-name/
   manifest.lock        # manifest for auditing / reproducibility
 ```
 
+## Shim extraction cache
+
+Shims unpack bundles into a cache directory:
+
+- Default: `~/.cache/sidebundle/<bundle-name>`
+- Override: `SIDEBUNDLE_EXTRACT_DIR=/abs/path`
+- Force re-extract: `SIDEBUNDLE_FORCE_EXTRACT=1`
+
+If you reuse the same bundle name with different contents, delete the old cache directory or set
+`SIDEBUNDLE_EXTRACT_DIR` to avoid hash mismatches.
+
 ## Entry specs
 
 - Host: `--from-host PATH[::trace=<command>]`

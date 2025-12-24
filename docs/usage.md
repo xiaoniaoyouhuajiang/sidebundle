@@ -29,6 +29,16 @@ bundle-name/
   manifest.lock        # 描述所有发布文件的 manifest
 ```
 
+## Shim 解包缓存
+
+shim 会在首次运行时解包 bundle 到缓存目录：
+
+- 默认：`~/.cache/sidebundle/<bundle-name>`
+- 覆盖：`SIDEBUNDLE_EXTRACT_DIR=/abs/path`
+- 强制重解包：`SIDEBUNDLE_FORCE_EXTRACT=1`
+
+如果复用同名 bundle 且内容不同，建议清理旧缓存或设置新的 `SIDEBUNDLE_EXTRACT_DIR`，以避免哈希不一致。
+
 ## `create`：从宿主机打包（`--from-host`）
 
 规格：

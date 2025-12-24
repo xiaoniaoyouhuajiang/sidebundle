@@ -16,6 +16,19 @@ bwrap: Creating new namespace failed, likely because the kernel does not support
 
 说明当前环境无法使用 unprivileged userns（或被容器/沙箱限制），需要更换运行环境或改用 `--run-mode host`/`chroot`。
 
+## 容器内运行与权限
+
+如果你在容器内运行 bwrap，额外需要有足够的权限来创建和配置 namespace。若出现：
+
+```
+bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+```
+
+说明新建 netns 时缺少 `CAP_NET_ADMIN`（rootless Docker/Podman 或以非 root 用户运行时常见）。可选方案：
+
+- 使用 root 用户、rootful Docker，并赋予足够权限（如 `--privileged`）。
+- 在该环境中改用 `--run-mode host`。
+
 ## embedded-bwrap：无需系统安装 bwrap
 
 GitHub Releases 同时提供两套 musl 二进制：
@@ -40,4 +53,3 @@ launcher 会按以下优先级选择 bwrap：
 
 - 迁移验证/CI：优先用 `--run-mode bwrap`（更严格，能更早发现缺文件）。
 - 目标环境不支持 userns：改用 `--run-mode host`（但更容易被宿主兜底，迁移验证能力弱）。
-

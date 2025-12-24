@@ -43,6 +43,16 @@ sidebundle 的依赖收集分为两层：
 - 用“尽可能短、可退出”的命令触发依赖加载（例如 `-version`、`--help`）。
 - 语言运行时的资源收集常需要更强的触发（例如 Python：`-c 'import encodings'`）。
 
+## 控制 trace 体积（Python/Node）
+
+trace 结果仅包含运行时实际访问到的文件。如果包体积异常膨胀，通常是运行时扫描了超出预期的目录
+（例如 pyenv 或用户级 site-packages）。Python/Node 启动时可能扫描大量包目录，建议：
+
+- 使用最小化的虚拟环境（只安装需要的包）。
+- 设置 `PYTHONNOUSERSITE=1`，跳过用户级 site-packages。
+- 尽量使用更明确的启动方式（例如 `python -S` 或 `-c 'import ...'`）。
+- 通过 `PYTHONPATH` 限制搜索路径。
+
 ## bwrap/chroot 与 trace 的关系（易踩坑）
 
 - `--run-mode` 控制最终生成的 launcher 如何运行 bundle（Host/Bwrap/Chroot）。
@@ -62,4 +72,3 @@ sidebundle 的依赖收集分为两层：
 - 权限矩阵：`docs/permissions.md`
 - 特殊场景备忘：`docs/special_handling.md`
 - 常见报错排查：`docs/faq.md`
-
