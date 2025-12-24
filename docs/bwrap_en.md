@@ -16,6 +16,19 @@ bwrap: Creating new namespace failed, likely because the kernel does not support
 
 your environment cannot use userns (or is restricted by a container/sandbox). Use another host, or fall back to `--run-mode host`/`chroot`.
 
+## Containers & permissions
+
+When running inside containers, bwrap also needs enough privileges to create and configure namespaces. If you see:
+
+```
+bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+```
+
+then the process lacks `CAP_NET_ADMIN` in the new network namespace (common in rootless Docker/Podman or non-root container users). Fixes:
+
+- Run the container as root with sufficient privileges (`--privileged` on rootful Docker).
+- Avoid bwrap for that environment and use `--run-mode host`.
+
 ## embedded-bwrap binaries
 
 GitHub Releases ship two musl binaries:
@@ -31,4 +44,3 @@ Priority order:
 1. `SIDEBUNDLE_BWRAP=/abs/path/to/bwrap`
 2. system `bwrap` from `PATH` / common locations
 3. extracted embedded bwrap (embedded builds only)
-

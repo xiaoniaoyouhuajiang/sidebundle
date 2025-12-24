@@ -28,11 +28,15 @@ Inspired by:
 `scip-index` bundle size comparison
 ![compare](./statics/compares.png)
 
-1.Basic Demo: No More Being Troubled by 'glibc_x not found' and 'libx.so: cannot open shared object'
+1.All-in-one demo: One-stop packaging (Python + Java + Node)
+
+https://github.com/user-attachments/assets/85136988-3d6e-4760-b9f8-adca0334194e
+
+2.Basic Demo: No More Being Troubled by 'glibc_x not found' and 'libx.so: cannot open shared object'
 
 https://github.com/user-attachments/assets/0b0b1e63-c268-4217-afb0-489168ec6ece
 
-2.Image usage: Extracting a shebang script (javascript) and its underlying ELF dependency (node) from a Docker (or podman) image and running it perfectly in a completely different Linux environment.
+3.Image usage: Extracting a shebang script (javascript) and its underlying ELF dependency (node) from a Docker (or podman) image and running it perfectly in a completely different Linux environment.
 
 https://github.com/user-attachments/assets/0d4f2ec8-2864-4a33-ab3f-e51773a10af2
 
