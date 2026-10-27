@@ -171,6 +171,24 @@ sidebundle-cli create \
   --copy-dir /etc/java-17-openjdk/security:/usr/lib/jvm/java-17-openjdk-amd64/conf/security
 ```
 
+## 环境变量与数据前缀（P0-1 / PATH_ENV）
+
+launcher **不会**再用 `metadata.env` 整表替换调用方环境。合并优先级（高到低）：
+
+1. `--set-env`（写入 `env_overrides`）
+2. 调用方进程环境（`HTTPS_PROXY`、`PATH`、`HOME`、调用方自己的 `TESSDATA_PREFIX` 等）
+3. 打包时写入的 `env_defaults`（可移植数据前缀）
+4. 镜像 agent 捕获的 `env`（只填补仍然缺失的键）
+
+`${SIDEBUNDLE_ROOT}` 与相对 bundle 根的路径在启动时展开，因此不能把 CA 写成死的 `/b/payload/...`。对 curl / 链接了 libssl 的入口，打包器会尝试把 CA bundle 放进 payload，并设置：
+
+```text
+SSL_CERT_FILE=${SIDEBUNDLE_ROOT}/payload/etc/ssl/certs/ca-certificates.crt
+CURL_CA_BUNDLE=${SIDEBUNDLE_ROOT}/payload/...
+```
+
+tesseract 会同样处理含 `eng.traineddata` 的 tessdata 目录（`TESSDATA_PREFIX`）。若 payload 里已经有这些文件但 metadata 仍指向宿主上不存在的绝对路径，launcher 会改指到 payload。调用方显式设置的同名变量不会被改写。
+
 ## 迁移验证建议
 
 最简单的迁移验证方式是：把 bundle 复制到“尽量干净”的同架构系统/容器中运行 entry。

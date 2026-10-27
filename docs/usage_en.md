@@ -37,6 +37,17 @@ If you reuse the same bundle name with different contents, delete the old cache 
 - `--set-env KEY=VALUE` (repeatable)
 - `--log-level info|debug|trace`
 
+## Environment merge and data prefixes
+
+The launcher merges environments. It does not replace the caller environment when `metadata.env` is set (matrix P0-1 / PATH_ENV). Precedence:
+
+1. `--set-env`
+2. caller environment
+3. packaged `env_defaults` (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `TESSDATA_PREFIX`, …)
+4. image-agent captured defaults, only for keys that are still unset
+
+`${SIDEBUNDLE_ROOT}` and paths relative to the bundle root are expanded at startup, so a hard-coded `/b/payload/...` mount point is unnecessary. curl (and other libssl/libcurl entries) and tesseract get those prefixes automatically when the files exist in the origin root.
+
 ## Common runtime recipes
 
 - Python: use an explicit trace trigger (e.g. `-c 'import encodings'`) and/or copy stdlib.

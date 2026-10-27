@@ -58,7 +58,27 @@
 - 对照 `docs/permissions.md` 先确认当前运行环境是否允许所选 backend。
 - 在容器场景下优先考虑 image-agent 模式（把 trace 放到容器内做）。
 
-## 7) `mknod EPERM ... writing stub file`
+## 7) centos:7 / ubuntu 18.04：`GLIBC_x.xx not found`（launcher）
+
+现象：gnu 开发构建打出来的 bundle，入口在老 glibc 上无法启动（矩阵：`true (gnu)` / LAUNCH_FAIL / **P0-3**）。musl 发布物上的 `/bin/true` 可以通过。
+
+原因：嵌入 launcher 动态链接了构建机 glibc。
+
+建议：
+- 使用 GitHub Releases 的 `sidebundle-*-musl`。
+- 或 `rustup target add x86_64-unknown-linux-musl` 后重新构建（已安装 musl target 时，packager 会默认把 launcher/shim 编成 musl）。
+- 详见 `docs/install.md`。
+
+## 8) curl `(77) error setting certificate file` / tesseract `0 languages`
+
+原因：CA 或 tessdata 的绝对路径留在宿主上；旧 launcher 还会在 `metadata.env` 非空时丢掉调用方的 `HTTPS_PROXY` / `TESSDATA_PREFIX`（矩阵：curl-host、curl-setenv、tesseract / **PATH_ENV** / **P0-1**）。
+
+建议：
+- 使用包含本次修复的 sidebundle。打包 curl / tesseract 时会写入 `${SIDEBUNDLE_ROOT}` 形式的 `SSL_CERT_FILE` / `TESSDATA_PREFIX`。
+- 不要把证书路径写成固定挂载点 `/b/...`。
+- `--set-env` 只覆盖同名变量，不再清空其余环境。
+
+## 9) `mknod EPERM ... writing stub file`
 
 原因：打包阶段尝试创建 `/dev/null` 等字符设备节点，当前用户缺乏 `mknod` 权限。
 
