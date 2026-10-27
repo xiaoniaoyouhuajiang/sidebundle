@@ -137,12 +137,24 @@ pub struct SystemInfo {
 }
 
 /// 入口所需的运行期元数据（AUXV、环境变量等）。
+///
+/// 环境变量分三层，launcher 按此合并（见 `docs/proposals/2026-10-28-verification-fixes.md`）：
+/// - `env_overrides`：`--set-env`，始终覆盖调用方
+/// - 调用方进程环境
+/// - `env_defaults`：打包器写入的可移植数据前缀（仅填补缺失键）
+/// - `env`：镜像 agent 捕获的默认值（仅填补仍缺失的键；历史字段，不再整表替换）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeMetadata {
     #[serde(default)]
     pub auxv: Vec<AuxvEntry>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// 产品注入的默认值（CA、tessdata 等）。调用方已设置的同名变量优先。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_defaults: BTreeMap<String, String>,
+    /// 显式覆盖（`--set-env`）。优先于调用方环境与 `env`/`env_defaults`。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_overrides: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uname: Option<SystemInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +167,8 @@ impl RuntimeMetadata {
     pub fn is_empty(&self) -> bool {
         self.auxv.is_empty()
             && self.env.is_empty()
+            && self.env_defaults.is_empty()
+            && self.env_overrides.is_empty()
             && self.uname.is_none()
             && self.platform.is_none()
             && self.random.is_none()

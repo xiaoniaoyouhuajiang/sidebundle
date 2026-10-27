@@ -30,6 +30,7 @@ use sidebundle_core::{
 use sidebundle_packager::Packager;
 
 mod agent;
+mod portable_data;
 use agent::{AgentLaunchConfig, AgentRunResult, AgentTraceRunner};
 
 fn main() {
@@ -200,6 +201,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .context("failed to backfill system assets")?;
     add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
         .context("failed to apply --copy-dir entries")?;
+    let origin_roots = collect_origin_roots(&closure, &resolver_entries);
+    portable_data::inject_portable_data(&mut closure, &origin_roots)
+        .context("failed to inject portable data prefixes")?;
     apply_env_overrides(&mut closure, &set_env);
     sanitize_symlinks(&mut closure);
 
@@ -1705,15 +1709,18 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
         return;
     }
     let overrides: BTreeMap<String, String> = overrides.iter().cloned().collect();
-    for snapshot in closure.metadata.values_mut() {
-        snapshot.env.extend(overrides.clone());
-    }
-    for origin in closure.entry_plans.iter().map(|p| p.origin().clone()) {
+    let mut origins: Vec<Origin> = closure.metadata.keys().cloned().collect();
+    origins.extend(closure.entry_plans.iter().map(|plan| plan.origin().clone()));
+    let mut seen = HashSet::new();
+    for origin in origins {
+        if !seen.insert(origin.clone()) {
+            continue;
+        }
         closure
             .metadata
-            .entry(origin.clone())
+            .entry(origin)
             .or_default()
-            .env
+            .env_overrides
             .extend(overrides.clone());
     }
 }
@@ -1854,7 +1861,29 @@ fn capture_runtime_metadata() -> Result<RuntimeMetadata> {
         uname,
         platform,
         random,
+        ..RuntimeMetadata::default()
     })
+}
+
+fn collect_origin_roots(
+    closure: &DependencyClosure,
+    resolvers: &[(Origin, Arc<dyn PathResolver>)],
+) -> Vec<(Origin, PathBuf)> {
+    let mut roots: Vec<(Origin, PathBuf)> = Vec::new();
+    let mut seen = HashSet::new();
+    for plan in &closure.entry_plans {
+        let origin = plan.origin().clone();
+        if !seen.insert(origin.clone()) {
+            continue;
+        }
+        let root = resolvers
+            .iter()
+            .find(|(candidate, _)| candidate == &origin)
+            .and_then(|(_, resolver)| resolver.trace_root().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        roots.push((origin, root));
+    }
+    roots
 }
 
 fn read_auxv_entries() -> Result<Vec<AuxvEntry>> {

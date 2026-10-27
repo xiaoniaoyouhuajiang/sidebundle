@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use sidebundle_core::{RunMode, RuntimeMetadata};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -9,6 +9,27 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+
+/// Single-path variables whose absolute host paths should follow the payload, and whose
+/// relative values or `${SIDEBUNDLE_ROOT}` tokens are resolved against the bundle root.
+const PORTABLE_PATH_KEYS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "TESSDATA_PREFIX",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "MAGICK_CONFIGURE_PATH",
+    "MAGICK_CODER_MODULE_PATH",
+];
+
+const CA_REL_CANDIDATES: &[&str] = &[
+    "etc/ssl/certs/ca-certificates.crt",
+    "etc/ssl/cert.pem",
+    "etc/pki/tls/certs/ca-bundle.crt",
+    "etc/ssl/certs/ca-bundle.crt",
+];
 
 fn main() {
     if let Err(err) = run() {
@@ -260,14 +281,50 @@ fn build_env_block(
     library_paths: &[PathBuf],
     metadata: Option<&RuntimeMetadata>,
 ) -> Result<Vec<CString>> {
-    let mut env_map: BTreeMap<String, String> = metadata
-        .cloned()
-        .map(|meta| meta.env)
-        .unwrap_or_else(|| env::vars().collect());
-    env_map.insert(
-        "SIDEBUNDLE_ROOT".into(),
-        bundle_root.to_string_lossy().into_owned(),
-    );
+    let caller = env::vars().collect();
+    let env_map = assemble_env(caller, metadata, bundle_root, run_mode, library_paths);
+    let mut block = Vec::new();
+    for (key, value) in env_map {
+        let mut pair = key;
+        pair.push('=');
+        pair.push_str(&value);
+        block.push(CString::new(pair).map_err(|err| anyhow!("invalid env: {err}"))?);
+    }
+    Ok(block)
+}
+
+/// Merge caller env with bundle metadata.
+///
+/// Precedence (highest wins): `env_overrides` (`--set-env`) > caller > `env_defaults`
+/// (portable data prefixes) > `env` (agent-captured defaults). A non-empty `env` map must
+/// not wipe caller variables such as `HTTPS_PROXY` or `PATH` (matrix: P0-1 / PATH_ENV).
+fn assemble_env(
+    caller: BTreeMap<String, String>,
+    metadata: Option<&RuntimeMetadata>,
+    bundle_root: &Path,
+    run_mode: RunMode,
+    library_paths: &[PathBuf],
+) -> BTreeMap<String, String> {
+    let mut protected: HashSet<String> = caller.keys().cloned().collect();
+    let mut env_map = caller;
+    if let Some(meta) = metadata {
+        for (key, value) in &meta.env_defaults {
+            env_map.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        for (key, value) in &meta.env {
+            env_map.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        for (key, value) in &meta.env_overrides {
+            protected.insert(key.clone());
+            env_map.insert(key.clone(), value.clone());
+        }
+    }
+    let root_text = bundle_root.to_string_lossy().into_owned();
+    env_map.insert("SIDEBUNDLE_ROOT".into(), root_text.clone());
+    for value in env_map.values_mut() {
+        *value = expand_sidebundle_root(value, &root_text);
+    }
+    absolutize_portable_paths(&mut env_map, bundle_root);
 
     let remapper = EnvRemapper::new(bundle_root);
 
@@ -347,14 +404,165 @@ fn build_env_block(
         }
     }
 
-    let mut block = Vec::new();
-    for (key, value) in env_map {
-        let mut pair = key;
-        pair.push('=');
-        pair.push_str(&value);
-        block.push(CString::new(pair).map_err(|err| anyhow!("invalid env: {err}"))?);
+    for key in PORTABLE_PATH_KEYS {
+        remap_portable_if_present(&mut env_map, bundle_root, key);
     }
-    Ok(block)
+    repair_portable_prefixes(&mut env_map, bundle_root, &protected);
+    env_map
+}
+
+fn absolutize_portable_paths(env_map: &mut BTreeMap<String, String>, bundle_root: &Path) {
+    for key in PORTABLE_PATH_KEYS {
+        let Some(value) = env_map.get(*key).cloned() else {
+            continue;
+        };
+        if value.is_empty() || value.starts_with('/') {
+            continue;
+        }
+        let joined = bundle_root.join(&value);
+        env_map.insert((*key).to_string(), joined.to_string_lossy().into_owned());
+    }
+}
+
+fn remap_portable_if_present(
+    env_map: &mut BTreeMap<String, String>,
+    bundle_root: &Path,
+    key: &str,
+) {
+    let Some(value) = env_map.get(key).cloned() else {
+        return;
+    };
+    if !value.starts_with('/') {
+        return;
+    }
+    let payload = bundle_root.join("payload");
+    let path = PathBuf::from(&value);
+    if path.starts_with(&payload) || path.starts_with(bundle_root) {
+        return;
+    }
+    let mut mapped = payload;
+    mapped.push(value.trim_start_matches('/'));
+    if mapped.exists() {
+        env_map.insert(key.to_string(), mapped.to_string_lossy().into_owned());
+    }
+}
+
+fn repair_portable_prefixes(
+    env_map: &mut BTreeMap<String, String>,
+    bundle_root: &Path,
+    protected: &HashSet<String>,
+) {
+    let payload = bundle_root.join("payload");
+    if !protected.contains("SSL_CERT_FILE") && !configured_path_exists(env_map.get("SSL_CERT_FILE"))
+    {
+        if let Some(ca) = find_ca_file(&payload) {
+            let text = ca.to_string_lossy().into_owned();
+            env_map.insert("SSL_CERT_FILE".into(), text.clone());
+            if !protected.contains("CURL_CA_BUNDLE")
+                && !configured_path_exists(env_map.get("CURL_CA_BUNDLE"))
+            {
+                env_map.insert("CURL_CA_BUNDLE".into(), text.clone());
+            }
+            if !protected.contains("REQUESTS_CA_BUNDLE")
+                && !configured_path_exists(env_map.get("REQUESTS_CA_BUNDLE"))
+            {
+                env_map.insert("REQUESTS_CA_BUNDLE".into(), text);
+            }
+        }
+    }
+    if !protected.contains("CURL_CA_BUNDLE")
+        && !configured_path_exists(env_map.get("CURL_CA_BUNDLE"))
+    {
+        if let Some(value) = env_map.get("SSL_CERT_FILE").cloned() {
+            if Path::new(&value).exists() {
+                env_map.insert("CURL_CA_BUNDLE".into(), value);
+            }
+        }
+    }
+    if !protected.contains("TESSDATA_PREFIX")
+        && !configured_path_exists(env_map.get("TESSDATA_PREFIX"))
+    {
+        if let Some(dir) = find_tessdata_dir(&payload) {
+            env_map.insert("TESSDATA_PREFIX".into(), dir.to_string_lossy().into_owned());
+        }
+    }
+}
+
+fn configured_path_exists(value: Option<&String>) -> bool {
+    value.is_some_and(|text| !text.is_empty() && Path::new(text).exists())
+}
+
+fn find_ca_file(payload: &Path) -> Option<PathBuf> {
+    CA_REL_CANDIDATES
+        .iter()
+        .map(|rel| payload.join(rel))
+        .find(|path| path.is_file())
+}
+
+fn find_tessdata_dir(payload: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![
+        payload.join("usr/share/tessdata"),
+        payload.join("usr/local/share/tessdata"),
+        payload.join("usr/share/tesseract-ocr/tessdata"),
+    ];
+    let version_root = payload.join("usr/share/tesseract-ocr");
+    if let Ok(entries) = fs::read_dir(&version_root) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("tessdata"));
+            candidates.push(entry.path());
+        }
+    }
+    let mut fallback = None;
+    for dir in candidates {
+        if !dir.is_dir() {
+            continue;
+        }
+        if dir.join("eng.traineddata").is_file() {
+            return Some(dir);
+        }
+        if fallback.is_none() && dir_has_traineddata(&dir) {
+            fallback = Some(dir);
+        }
+    }
+    fallback
+}
+
+fn dir_has_traineddata(dir: &Path) -> bool {
+    fs::read_dir(dir).ok().is_some_and(|mut entries| {
+        entries.any(|entry| {
+            entry
+                .ok()
+                .and_then(|ent| {
+                    ent.file_name()
+                        .to_str()
+                        .map(|name| name.ends_with(".traineddata"))
+                })
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn expand_sidebundle_root(value: &str, root: &str) -> String {
+    let with_braces = value.replace("${SIDEBUNDLE_ROOT}", root);
+    let needle = "$SIDEBUNDLE_ROOT";
+    let mut out = String::new();
+    let mut rest = with_braces.as_str();
+    while let Some(idx) = rest.find(needle) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + needle.len()..];
+        let glued = after
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if glued {
+            out.push_str(needle);
+        } else {
+            out.push_str(root);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn remap_path_entries(bundle_root: &Path, mode: RunMode, path: &str) -> Vec<String> {
@@ -786,7 +994,8 @@ fn exec_chroot(
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvRemapper, RunMode};
+    use super::{assemble_env, expand_sidebundle_root, EnvRemapper, RunMode};
+    use sidebundle_core::RuntimeMetadata;
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -847,5 +1056,204 @@ mod tests {
             env_map.get("PYTHONPATH").unwrap(),
             "rel:/tmp/bundle/payload/usr/lib/python3.10:/tmp/bundle/payload/x"
         );
+    }
+
+    fn caller(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn metadata_env_does_not_wipe_caller() {
+        let mut meta = RuntimeMetadata::default();
+        meta.env.insert("PATH".into(), "/usr/bin".into());
+        meta.env.insert("HOME".into(), "/root".into());
+        meta.env.insert("FOO".into(), "from-agent".into());
+        let merged = assemble_env(
+            caller(&[
+                ("PATH", "/caller/bin"),
+                ("HOME", "/home/user"),
+                ("HTTPS_PROXY", "http://127.0.0.1:9"),
+                ("BAR", "2"),
+            ]),
+            Some(&meta),
+            Path::new("/tmp/bundle"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            merged.get("PATH").unwrap().split(':').next().unwrap(),
+            "/tmp/bundle/caller/bin"
+        );
+        assert!(merged.get("PATH").unwrap().contains("/caller/bin"));
+        assert_eq!(merged.get("HOME").unwrap(), "/home/user");
+        assert_eq!(merged.get("HTTPS_PROXY").unwrap(), "http://127.0.0.1:9");
+        assert_eq!(merged.get("BAR").unwrap(), "2");
+        assert_eq!(merged.get("FOO").unwrap(), "from-agent");
+    }
+
+    #[test]
+    fn set_env_overrides_caller_and_agent() {
+        let mut meta = RuntimeMetadata::default();
+        meta.env.insert(
+            "SSL_CERT_FILE".into(),
+            "/etc/ssl/certs/ca-certificates.crt".into(),
+        );
+        meta.env_overrides
+            .insert("SSL_CERT_FILE".into(), "/custom/ca.crt".into());
+        let merged = assemble_env(
+            caller(&[
+                ("SSL_CERT_FILE", "/caller/ca.crt"),
+                ("HTTPS_PROXY", "http://proxy"),
+            ]),
+            Some(&meta),
+            Path::new("/tmp/bundle"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(merged.get("SSL_CERT_FILE").unwrap(), "/custom/ca.crt");
+        assert_eq!(merged.get("HTTPS_PROXY").unwrap(), "http://proxy");
+    }
+
+    #[test]
+    fn expands_sidebundle_root_and_relative_payload_paths() {
+        assert_eq!(
+            expand_sidebundle_root("${SIDEBUNDLE_ROOT}/payload/ca.crt", "/opt/bundle"),
+            "/opt/bundle/payload/ca.crt"
+        );
+        assert_eq!(
+            expand_sidebundle_root("$SIDEBUNDLE_ROOT/payload/ca.crt", "/opt/bundle"),
+            "/opt/bundle/payload/ca.crt"
+        );
+        assert_eq!(
+            expand_sidebundle_root("$SIDEBUNDLE_ROOT_FOO", "/opt/bundle"),
+            "$SIDEBUNDLE_ROOT_FOO"
+        );
+
+        let mut meta = RuntimeMetadata::default();
+        meta.env_overrides.insert(
+            "SSL_CERT_FILE".into(),
+            "${SIDEBUNDLE_ROOT}/payload/etc/ssl/certs/ca-certificates.crt".into(),
+        );
+        meta.env_defaults.insert(
+            "TESSDATA_PREFIX".into(),
+            "payload/usr/share/tessdata".into(),
+        );
+        let merged = assemble_env(
+            caller(&[]),
+            Some(&meta),
+            Path::new("/opt/bundle"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            merged.get("SSL_CERT_FILE").unwrap(),
+            "/opt/bundle/payload/etc/ssl/certs/ca-certificates.crt"
+        );
+        assert_eq!(
+            merged.get("TESSDATA_PREFIX").unwrap(),
+            "/opt/bundle/payload/usr/share/tessdata"
+        );
+    }
+
+    #[test]
+    fn caller_prefix_beats_agent_and_product_default() {
+        let mut meta = RuntimeMetadata::default();
+        meta.env
+            .insert("TESSDATA_PREFIX".into(), "/usr/share/tessdata".into());
+        meta.env_defaults.insert(
+            "TESSDATA_PREFIX".into(),
+            "/opt/bundle/payload/tessdata".into(),
+        );
+        let merged = assemble_env(
+            caller(&[("TESSDATA_PREFIX", "/custom/tessdata")]),
+            Some(&meta),
+            Path::new("/opt/bundle"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(merged.get("TESSDATA_PREFIX").unwrap(), "/custom/tessdata");
+    }
+
+    #[test]
+    fn product_default_beats_agent_env() {
+        let mut meta = RuntimeMetadata::default();
+        meta.env.insert(
+            "SSL_CERT_FILE".into(),
+            "/etc/ssl/certs/ca-certificates.crt".into(),
+        );
+        meta.env_defaults
+            .insert("SSL_CERT_FILE".into(), "/opt/bundle/payload/ca.crt".into());
+        let merged = assemble_env(
+            caller(&[("HTTPS_PROXY", "http://proxy")]),
+            Some(&meta),
+            Path::new("/opt/bundle"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            merged.get("SSL_CERT_FILE").unwrap(),
+            "/opt/bundle/payload/ca.crt"
+        );
+        assert_eq!(merged.get("HTTPS_PROXY").unwrap(), "http://proxy");
+    }
+
+    #[test]
+    fn repairs_missing_ca_and_tessdata_from_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let ca = root
+            .path()
+            .join("payload/etc/ssl/certs/ca-certificates.crt");
+        std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
+        std::fs::write(&ca, b"ca").unwrap();
+        let tess = root.path().join("payload/usr/share/tessdata");
+        std::fs::create_dir_all(&tess).unwrap();
+        std::fs::write(tess.join("eng.traineddata"), b"eng").unwrap();
+
+        let mut meta = RuntimeMetadata::default();
+        meta.env.insert(
+            "SSL_CERT_FILE".into(),
+            "/etc/ssl/certs/ca-certificates.crt".into(),
+        );
+        meta.env
+            .insert("TESSDATA_PREFIX".into(), "/usr/share/tessdata".into());
+        let merged = assemble_env(
+            caller(&[("LANG", "C")]),
+            Some(&meta),
+            root.path(),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            merged.get("SSL_CERT_FILE").map(String::as_str),
+            Some(ca.to_str().unwrap())
+        );
+        assert_eq!(
+            merged.get("CURL_CA_BUNDLE").map(String::as_str),
+            Some(ca.to_str().unwrap())
+        );
+        assert_eq!(
+            merged.get("TESSDATA_PREFIX").map(String::as_str),
+            Some(tess.to_str().unwrap())
+        );
+        assert_eq!(merged.get("LANG").unwrap(), "C");
+    }
+
+    #[test]
+    fn does_not_replace_caller_ca_or_invent_missing_payload() {
+        let merged = assemble_env(
+            caller(&[("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")]),
+            None,
+            Path::new("/tmp/bundle-does-not-exist"),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            merged.get("SSL_CERT_FILE").unwrap(),
+            "/etc/ssl/certs/ca-certificates.crt"
+        );
+        assert!(!merged.contains_key("TESSDATA_PREFIX"));
     }
 }
