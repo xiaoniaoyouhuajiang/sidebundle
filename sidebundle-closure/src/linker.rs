@@ -10,9 +10,18 @@ pub struct LibraryResolution {
     pub target: PathBuf,
 }
 
+/// `ld.so --list` output, including libraries the linker could not resolve.
+/// A missing soname is not fatal by itself: callers may search private directories
+/// (`pulseaudio/`, `$ORIGIN`) before failing the pack.
+#[derive(Debug, Clone)]
+pub struct TraceListing {
+    pub resolved: Vec<LibraryResolution>,
+    pub missing: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkerRunner {
-    cache: Arc<Mutex<HashMap<CacheKey, Vec<LibraryResolution>>>>,
+    cache: Arc<Mutex<HashMap<CacheKey, TraceListing>>>,
 }
 
 impl Default for LinkerRunner {
@@ -42,6 +51,27 @@ impl LinkerRunner {
         subject: &Path,
         search_paths: &[PathBuf],
     ) -> Result<Vec<LibraryResolution>, LinkerError> {
+        let listing = self.trace_dependencies_partial(linker, subject, search_paths)?;
+        if let Some(name) = listing.missing.first() {
+            return Err(LinkerError::LibraryNotFound {
+                name: name.clone(),
+                raw: format!("{name} => not found"),
+            });
+        }
+        Ok(listing.resolved)
+    }
+
+    /// Like [`Self::trace_dependencies`], but keeps libraries that failed to resolve.
+    ///
+    /// GNU ld.so exits non-zero when any dependency is missing and still prints the
+    /// resolved entries on stdout. Treating that as a hard command failure dropped
+    /// private-directory libraries such as `libpulsecommon-*.so` (matrix: MISSING_SO).
+    pub fn trace_dependencies_partial(
+        &self,
+        linker: &Path,
+        subject: &Path,
+        search_paths: &[PathBuf],
+    ) -> Result<TraceListing, LinkerError> {
         let subject = Self::resolve_subject(subject);
         let cache_key = CacheKey {
             linker: linker.to_path_buf(),
@@ -73,24 +103,30 @@ impl LinkerRunner {
             source,
         })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if is_gcompat_stub(&stdout, &stderr) {
-                return Err(LinkerError::UnsupportedStub {
-                    linker: linker.to_path_buf(),
-                    message: format_stub_message(&stdout, &stderr),
-                });
-            }
-            return Err(LinkerError::CommandFailed {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if is_gcompat_stub(&stdout, &stderr) {
+            return Err(LinkerError::UnsupportedStub {
                 linker: linker.to_path_buf(),
-                status: output.status.code(),
-                stderr,
+                message: format_stub_message(&stdout, &stderr),
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed = parse_trace_output(stdout.as_ref())?;
+        let parsed = match interpret_linker_output(output.status.success(), &stdout) {
+            Ok(parsed) => parsed,
+            Err(()) => {
+                let detail = if stderr.is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr
+                };
+                return Err(LinkerError::CommandFailed {
+                    linker: linker.to_path_buf(),
+                    status: output.status.code(),
+                    stderr: detail,
+                });
+            }
+        };
 
         if let Ok(mut map) = self.cache.lock() {
             map.insert(cache_key, parsed.clone());
@@ -122,29 +158,39 @@ fn join_paths(paths: &[PathBuf]) -> Result<String, LinkerError> {
     Ok(encoded.join(":"))
 }
 
-fn parse_trace_output(output: &str) -> Result<Vec<LibraryResolution>, LinkerError> {
-    let mut libs = Vec::new();
+/// Keep a partial listing when ld.so exits non-zero after printing dependencies.
+/// An empty failed run is still a command error.
+fn interpret_linker_output(status_ok: bool, stdout: &str) -> Result<TraceListing, ()> {
+    let parsed = parse_trace_output(stdout);
+    if !status_ok && parsed.resolved.is_empty() && parsed.missing.is_empty() {
+        Err(())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_trace_output(output: &str) -> TraceListing {
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.contains("statically linked") {
+        if trimmed.is_empty() || trimmed.contains("statically linked") {
             continue;
         }
 
         if let Some((name, rest)) = trimmed.split_once("=>") {
             let lib_name = name.trim().to_string();
+            if lib_name.is_empty() {
+                continue;
+            }
             let rhs = rest.trim();
             if rhs.starts_with("not found") {
-                return Err(LinkerError::LibraryNotFound {
-                    name: lib_name,
-                    raw: trimmed.to_string(),
-                });
+                missing.push(lib_name);
+                continue;
             }
             let path_part = rhs.split_whitespace().next().unwrap_or("");
             if path_part.starts_with('/') {
-                libs.push(LibraryResolution {
+                resolved.push(LibraryResolution {
                     name: lib_name,
                     target: PathBuf::from(path_part),
                 });
@@ -154,14 +200,14 @@ fn parse_trace_output(output: &str) -> Result<Vec<LibraryResolution>, LinkerErro
 
         if trimmed.starts_with('/') {
             let path_part = trimmed.split_whitespace().next().unwrap_or("");
-            libs.push(LibraryResolution {
+            resolved.push(LibraryResolution {
                 name: path_part.to_string(),
                 target: PathBuf::from(path_part),
             });
         }
     }
 
-    Ok(libs)
+    TraceListing { resolved, missing }
 }
 
 fn is_gcompat_stub(stdout: &str, stderr: &str) -> bool {
@@ -244,6 +290,28 @@ mod tests {
             panic!("fixture missing: {}", fixture.display());
         }
         assert!(is_gcompat_stub_binary(&fixture).unwrap());
+    }
+
+    #[test]
+    fn parse_trace_keeps_resolved_and_missing_libraries() {
+        let listing = super::parse_trace_output(
+            "\tlinux-vdso.so.1 (0x1)\n\tlibpulse.so.0 => /usr/lib/libpulse.so.0 (0x2)\n\tlibpulsecommon-16.1.so => not found\n\t/lib64/ld-linux-x86-64.so.2 (0x3)\n",
+        );
+        assert_eq!(listing.resolved.len(), 2);
+        assert_eq!(listing.resolved[0].name, "libpulse.so.0");
+        assert_eq!(listing.missing, vec!["libpulsecommon-16.1.so".to_string()]);
+    }
+
+    #[test]
+    fn nonzero_linker_status_keeps_partial_listing() {
+        let listing = super::interpret_linker_output(
+            false,
+            "\tlibfoo.so => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x1)\n",
+        )
+        .unwrap();
+        assert_eq!(listing.missing, vec!["libfoo.so".to_string()]);
+        assert_eq!(listing.resolved.len(), 1);
+        assert!(super::interpret_linker_output(false, "boom\n").is_err());
     }
 
     #[test]
