@@ -42,9 +42,13 @@ cargo build --release
 cargo install --path sidebundle-cli
 ```
 
+`cargo build`（gnu target）嵌入的 launcher **不是**可迁移产物。检验矩阵 `true (gnu 开发构建)` 在 centos:7 / ubuntu 18.04 上是 `LAUNCH_FAIL` / **GLIBC**（P0-3）：launcher 动态链接了构建机 glibc。发布脚本（`.github/workflows/release.yml`）只发布 musl 二进制。可迁移 bundle 请用下一节的 musl target。
+
+若本机已 `rustup target add x86_64-unknown-linux-musl` 且 `rust-lld` 可用，packager 会自动把嵌入的 launcher/shim 编成 musl，即使 CLI 本身是 gnu。否则 `create` 时会警告 launcher 不可迁移。可用 `SIDEBUNDLE_LAUNCHER_TARGET` 强制指定嵌入 launcher 的 target。
+
 ## 交叉编译（musl，推荐）
 
-sidebundle 常用于“在 A 系统打包，搬到 B 系统运行”。为了提高可迁移性，建议构建 musl 静态产物：
+sidebundle 常用于“在 A 系统打包，搬到 B 系统运行”。可迁移构建必须使用 musl 静态产物（发布物与 CI 的默认路径）：
 
 ```bash
 # x86_64

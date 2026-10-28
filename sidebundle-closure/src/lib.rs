@@ -44,21 +44,8 @@ const DEFAULT_SHEBANG_PATHS: &[&str] = &[
 const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
 const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
 const GLIBC_HWCAPS_SEGMENT: &str = "glibc-hwcaps";
-const GPU_LIB_PREFIXES: &[&str] = &[
-    "libgl",
-    "libgldispatch",
-    "libglx",
-    "libegl",
-    "libgles",
-    "libopencl",
-    "libvulkan",
-    "libcuda",
-    "libnvidia",
-    "libdrm",
-    "libnvoptix",
-    "libopenvr",
-    "libxnvctrl",
-];
+// Real GL/GLES/GLX/EGL sonames are matched in `is_gpu_library_name`. A bare
+// `libgl` prefix also matches `libglib-2.0` and `libglibmm`.
 
 const HOST_GLIBC_LINKERS: &[&str] = &[
     "/lib64/ld-linux-x86-64.so.2",
@@ -283,6 +270,10 @@ pub struct ClosureBuilder {
     default_paths: Vec<PathBuf>,
     origin_paths: HashMap<Origin, Vec<PathBuf>>,
     scanned_scripts: RefCell<HashSet<PathBuf>>,
+    /// DT_NEEDED paths that must ship even when they look like GPU libraries.
+    /// The dynamic linker cannot start ffmpeg without libdrm/libGLX; dlopen'd
+    /// driver files that are not in this set stay filtered.
+    load_time_deps: RefCell<HashSet<PathBuf>>,
     allow_gpu_libs: bool,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
@@ -300,6 +291,7 @@ impl ClosureBuilder {
             default_paths: DEFAULT_LIBRARY_DIRS.iter().map(PathBuf::from).collect(),
             origin_paths: HashMap::new(),
             scanned_scripts: RefCell::new(HashSet::new()),
+            load_time_deps: RefCell::new(HashSet::new()),
             allow_gpu_libs: false,
             runner: LinkerRunner::new(),
             tracer: None,
@@ -673,6 +665,8 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_source = self.canonical_entry_path(resolver, &entry.logical)?;
+        let entry_source =
+            prefer_real_elf(&entry_source, resolver.trace_root(), &entry.display_name)?;
         let mut state = PlanState::new(files, aliases, cache);
         self.build_entry_plan(
             resolver,
@@ -800,11 +794,12 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
-                if let Some(reason) = self.filter_reason(&canonical) {
+                if self.skip_loaded_dependency(&canonical) {
                     debug!(
-                        "skipping dependency {} for {} ({reason})",
+                        "skipping dependency {} for {} ({})",
                         canonical.display(),
-                        current.display()
+                        current.display(),
+                        classify_high_risk_asset(&canonical).unwrap_or("filtered")
                     );
                     continue;
                 }
@@ -820,18 +815,25 @@ impl ClosureBuilder {
                 );
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
-                    let mut alias_path = dir.to_path_buf();
-                    alias_path.push(&resolution.name);
-                    if let Some(logical) = resolver.host_to_logical(&canonical) {
-                        let mut runtime_alias = logical.path().to_path_buf();
-                        runtime_alias.set_file_name(&resolution.name);
-                        record_alias(state.aliases, &canonical, &runtime_alias);
-                    } else if alias_path != dest {
-                        record_alias(state.aliases, &canonical, &alias_path);
-                    }
                 }
+                record_soname_alias(resolver, state.aliases, &canonical, &resolution.name, &dest);
                 queue.push_back(canonical);
             }
+        }
+
+        if visited.iter().any(|path| is_magick_path(path)) || is_magick_path(entry_source) {
+            let root = resolver.trace_root().unwrap_or_else(|| Path::new("/"));
+            let modules = discover_imagemagick_modules(root);
+            self.ingest_layout_modules(
+                resolver,
+                origin,
+                &modules,
+                &mut visited,
+                &mut lib_dirs,
+                state,
+                interpreter_source.as_deref(),
+                is_static,
+            );
         }
 
         let libraries: Vec<PathBuf> = lib_dirs.into_iter().collect();
@@ -1154,8 +1156,26 @@ impl ClosureBuilder {
 
     fn filter_reason(&self, path: &Path) -> Option<&'static str> {
         match classify_high_risk_asset(path) {
-            Some("gpu-driver") if self.allow_gpu_libs => None,
+            Some("gpu-driver")
+                if self.allow_gpu_libs || self.load_time_deps.borrow().contains(path) =>
+            {
+                None
+            }
             other => other,
+        }
+    }
+
+    /// glibc-hwcaps stays out. A GPU-looking DT_NEEDED (libdrm, libGLX, …) is
+    /// recorded and kept: the loader needs it before main. Traced dlopen hits
+    /// are still dropped unless `--allow-gpu-libs` is set.
+    fn skip_loaded_dependency(&self, path: &Path) -> bool {
+        match classify_high_risk_asset(path) {
+            Some("gpu-driver") => {
+                self.load_time_deps.borrow_mut().insert(path.to_path_buf());
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -1276,11 +1296,11 @@ impl ClosureBuilder {
         if metadata.needed.is_empty() {
             return Ok(Vec::new());
         }
-        match self
+        let listing = match self
             .runner
-            .trace_dependencies(linker, subject, search_paths)
+            .trace_dependencies_partial(linker, subject, search_paths)
         {
-            Ok(resolved) => Ok(resolved),
+            Ok(listing) => listing,
             Err(linker_err) => {
                 if matches!(linker_err, linker::LinkerError::UnsupportedStub { .. }) {
                     warn!(
@@ -1290,10 +1310,143 @@ impl ClosureBuilder {
                     );
                     return Ok(Vec::new());
                 }
-                Err(ClosureError::LinkerTrace {
+                let mut resolved = Vec::new();
+                let still = augment_resolutions(&mut resolved, subject, metadata, search_paths);
+                if still.is_empty() {
+                    warn!(
+                        "linker trace failed for {} ({linker_err}); resolved DT_NEEDED via directory search",
+                        subject.display()
+                    );
+                    return Ok(resolved);
+                }
+                return Err(ClosureError::LinkerTrace {
                     path: subject.to_path_buf(),
                     source: linker_err,
-                })
+                });
+            }
+        };
+        let mut resolved = listing.resolved;
+        for name in &listing.missing {
+            if resolution_satisfies(&resolved, name) || should_skip_needed(name) {
+                continue;
+            }
+            if let Some(path) = find_needed_library(name, subject, search_paths) {
+                resolved.push(LibraryResolution {
+                    name: name.clone(),
+                    target: path,
+                });
+            }
+        }
+        let still = augment_resolutions(&mut resolved, subject, metadata, search_paths);
+        if !still.is_empty() {
+            return Err(ClosureError::LinkerTrace {
+                path: subject.to_path_buf(),
+                source: linker::LinkerError::LibraryNotFound {
+                    name: still[0].clone(),
+                    raw: format!(
+                        "missing after linker and private-directory search: {}",
+                        still.join(", ")
+                    ),
+                },
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// Pull ImageMagick coder/filter modules into the closure and walk their DT_NEEDED.
+    /// Failures are warnings: a single optional coder must not abort the pack.
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_layout_modules(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        modules: &[PathBuf],
+        visited: &mut HashSet<PathBuf>,
+        lib_dirs: &mut BTreeSet<PathBuf>,
+        state: &mut PlanState<'_>,
+        interpreter_source: Option<&Path>,
+        is_static: bool,
+    ) {
+        if modules.is_empty() || is_static {
+            return;
+        }
+        let Some(interpreter) = interpreter_source else {
+            return;
+        };
+        let mut queue: VecDeque<PathBuf> = VecDeque::new();
+        for module in modules {
+            let canonical = match canonicalize(module, resolver.trace_root()) {
+                Ok(path) => path,
+                Err(err) => {
+                    debug!("skipping ImageMagick module {}: {err}", module.display());
+                    continue;
+                }
+            };
+            let dest = ensure_file(resolver, state.files, state.aliases, &canonical, None);
+            if let Some(dir) = dest.parent() {
+                lib_dirs.insert(dir.to_path_buf());
+            }
+            queue.push_back(canonical);
+        }
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            let metadata = match self.load_metadata(&current, state.cache) {
+                Ok(metadata) => metadata.clone(),
+                Err(ClosureError::ElfParse {
+                    source: ElfParseError::NotElf { .. },
+                    ..
+                }) => continue,
+                Err(err) => {
+                    warn!("skipping ImageMagick module {}: {err}", current.display());
+                    continue;
+                }
+            };
+            let search_paths = self.compute_search_paths(resolver, origin, &current, &metadata);
+            let resolved = match self.trace_with_linker(
+                interpreter,
+                &current,
+                &search_paths,
+                &metadata,
+            ) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    warn!(
+                        "ImageMagick module {} is missing libraries ({err}); keeping the module file",
+                        current.display()
+                    );
+                    continue;
+                }
+            };
+            for resolution in resolved {
+                if Self::should_skip(&resolution.name) {
+                    continue;
+                }
+                let canonical = match canonicalize(&resolution.target, resolver.trace_root()) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        debug!(
+                            "skipping ImageMagick dependency {}: {err}",
+                            resolution.target.display()
+                        );
+                        continue;
+                    }
+                };
+                if self.skip_loaded_dependency(&canonical) {
+                    debug!(
+                        "skipping ImageMagick dependency {} ({})",
+                        canonical.display(),
+                        classify_high_risk_asset(&canonical).unwrap_or("filtered")
+                    );
+                    continue;
+                }
+                let dest = ensure_file(resolver, state.files, state.aliases, &canonical, None);
+                if let Some(dir) = dest.parent() {
+                    lib_dirs.insert(dir.to_path_buf());
+                }
+                record_soname_alias(resolver, state.aliases, &canonical, &resolution.name, &dest);
+                queue.push_back(canonical);
             }
         }
     }
@@ -1359,48 +1512,364 @@ impl Default for ClosureBuilder {
 }
 
 fn canonicalize(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureError> {
-    let target = if let Some(root) = root {
-        if path.starts_with(root) {
-            path.to_path_buf()
-        } else if path.is_absolute() {
-            let rel = path.strip_prefix("/").unwrap_or(path);
-            root.join(rel)
-        } else {
-            root.join(path)
-        }
-    } else {
-        path.to_path_buf()
-    };
-    debug!(
-        "canonicalize request path {} root {:?} => candidate {}",
-        path.display(),
-        root.map(|r| r.display().to_string()),
-        target.display()
-    );
-    match fs::canonicalize(&target) {
-        Ok(resolved) => {
-            if let Some(root) = root {
-                if !resolved.starts_with(root) && path.is_absolute() {
-                    debug!(
-                        "canonicalize {} resolved outside root {}; returning candidate {}",
-                        path.display(),
-                        root.display(),
-                        target.display()
-                    );
-                    return Ok(target);
-                }
-            }
-            debug!(
-                "canonicalize {} resolved to {}",
-                path.display(),
-                resolved.display()
-            );
-            Ok(resolved)
-        }
-        Err(source) => Err(ClosureError::Io {
+    let Some(root) = root else {
+        return fs::canonicalize(path).map_err(|source| ClosureError::Io {
             path: path.to_path_buf(),
             source,
+        });
+    };
+    // Resolve the root directory itself, then walk symlinks without leaving it.
+    // `fs::canonicalize` follows absolute links (Debian alternatives) onto the host.
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    debug!(
+        "canonicalize request path {} root {}",
+        path.display(),
+        root.display()
+    );
+    canonicalize_in_root(&root, path)
+}
+
+fn canonicalize_in_root(root: &Path, path: &Path) -> Result<PathBuf, ClosureError> {
+    let initial = if path.starts_with(root) {
+        path.to_path_buf()
+    } else if path.is_absolute() {
+        root.join(path.strip_prefix("/").unwrap_or(path))
+    } else {
+        root.join(path)
+    };
+    let mut stack: Vec<std::ffi::OsString> = Vec::new();
+    if let Ok(rel) = initial.strip_prefix(root) {
+        for component in rel.components() {
+            if let std::path::Component::Normal(part) = component {
+                stack.push(part.to_os_string());
+            }
+        }
+    }
+    let mut index = 0;
+    let mut hops = 0;
+    let mut last_link: Option<(PathBuf, PathBuf)> = None;
+    while index < stack.len() {
+        hops += 1;
+        if hops > 64 {
+            return Err(ClosureError::EntryResolution {
+                path: path.to_path_buf(),
+                message: format!("symlink cycle while resolving {}", path.display()),
+            });
+        }
+        let mut current = root.to_path_buf();
+        for part in stack.iter().take(index + 1) {
+            current.push(part);
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = fs::read_link(&current).map_err(|source| ClosureError::Io {
+                    path: current.clone(),
+                    source,
+                })?;
+                last_link = Some((current, target.clone()));
+                let mut rebuilt = Vec::new();
+                if !target.is_absolute() {
+                    rebuilt.extend(stack.iter().take(index).cloned());
+                }
+                for component in target.components() {
+                    match component {
+                        std::path::Component::Normal(part) => rebuilt.push(part.to_os_string()),
+                        std::path::Component::ParentDir => {
+                            rebuilt.pop();
+                        }
+                        std::path::Component::CurDir | std::path::Component::RootDir => {}
+                        std::path::Component::Prefix(_) => {}
+                    }
+                }
+                rebuilt.extend(stack.iter().skip(index + 1).cloned());
+                stack = rebuilt;
+                index = 0;
+            }
+            Ok(_) => index += 1,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(dangling_entry_error(path, &current, last_link.as_ref()));
+            }
+            Err(source) => {
+                return Err(ClosureError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    let mut resolved = root.to_path_buf();
+    for part in &stack {
+        resolved.push(part);
+    }
+    if !resolved.exists() {
+        return Err(dangling_entry_error(path, &resolved, last_link.as_ref()));
+    }
+    debug!(
+        "canonicalize {} resolved inside root to {}",
+        path.display(),
+        resolved.display()
+    );
+    Ok(resolved)
+}
+
+fn dangling_entry_error(
+    requested: &Path,
+    missing: &Path,
+    last_link: Option<&(PathBuf, PathBuf)>,
+) -> ClosureError {
+    let message = if let Some((link, target)) = last_link {
+        let hint = if target.to_string_lossy().contains("alternatives") {
+            "This looks like a Debian alternatives symlink. Pass the real ELF (ImageMagick convert is often /usr/bin/convert-im6.q16)."
+        } else {
+            "Pass the real ELF path instead of a wrapper or dangling symlink."
+        };
+        format!(
+            "entry {} follows symlink {} -> {}, which does not exist inside the bundle root (missing {}). {hint}",
+            requested.display(),
+            link.display(),
+            target.display(),
+            missing.display()
+        )
+    } else {
+        format!(
+            "path {} does not exist inside the bundle root (missing {})",
+            requested.display(),
+            missing.display()
+        )
+    };
+    ClosureError::EntryResolution {
+        path: requested.to_path_buf(),
+        message,
+    }
+}
+
+fn prefer_real_elf(
+    path: &Path,
+    root: Option<&Path>,
+    entry_name: &str,
+) -> Result<PathBuf, ClosureError> {
+    if parse_elf_metadata(path).is_ok() {
+        return Ok(path.to_path_buf());
+    }
+    if !looks_like_pg_wrapper(path) {
+        return Ok(path.to_path_buf());
+    }
+    // `/usr/bin/psql` is a relative symlink to `pg_wrapper`. Search with the
+    // name the user asked for, not the script's own filename.
+    let name = entry_tool_name(path, entry_name);
+    let root = root.unwrap_or_else(|| Path::new("/"));
+    let matches = find_postgresql_elfs(root, &name);
+    match matches.len() {
+        1 => {
+            warn!(
+                "entry {} is a PostgreSQL pg_wrapper script; using real ELF {}",
+                path.display(),
+                matches[0].display()
+            );
+            Ok(matches[0].clone())
+        }
+        0 => Err(ClosureError::EntryResolution {
+            path: path.to_path_buf(),
+            message: format!(
+                "entry {} is a Perl pg_wrapper script, not an ELF. Pass the real client binary, typically /usr/lib/postgresql/<version>/bin/{name}",
+                path.display()
+            ),
         }),
+        _ => {
+            let listed = matches
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(ClosureError::EntryResolution {
+                path: path.to_path_buf(),
+                message: format!(
+                    "entry {} is a Perl pg_wrapper script and multiple ELFs match: {listed}. Pass one of those paths explicitly.",
+                    path.display()
+                ),
+            })
+        }
+    }
+}
+
+fn entry_tool_name(path: &Path, entry_name: &str) -> String {
+    let trimmed = entry_name.trim();
+    if !trimmed.is_empty() && !trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("psql")
+        .to_string()
+}
+
+fn looks_like_pg_wrapper(path: &Path) -> bool {
+    let mut buf = [0u8; 4096];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut buf) else {
+        return false;
+    };
+    if buf.starts_with(b"\x7fELF") {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf[..read]);
+    text.contains("PgCommon") || text.contains("pg_wrapper")
+}
+
+fn is_elf_file(path: &Path) -> bool {
+    let mut buf = [0u8; 4];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    matches!(file.read(&mut buf), Ok(4) if &buf == b"\x7fELF")
+}
+
+fn find_postgresql_elfs(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(versions) = fs::read_dir(root.join("usr/lib/postgresql")) else {
+        return found;
+    };
+    for version in versions.flatten() {
+        let candidate = version.path().join("bin").join(name);
+        if is_elf_file(&candidate) {
+            found.push(candidate);
+        }
+    }
+    found.sort();
+    found
+}
+
+fn should_skip_needed(name: &str) -> bool {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    base.starts_with("linux-vdso") || base.starts_with("ld-linux") || base.starts_with("ld-musl")
+}
+
+fn resolution_satisfies(resolved: &[LibraryResolution], name: &str) -> bool {
+    resolved.iter().any(|item| {
+        item.name == name
+            || item
+                .target
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| file == name)
+    })
+}
+
+fn augment_resolutions(
+    resolved: &mut Vec<LibraryResolution>,
+    subject: &Path,
+    metadata: &ElfMetadata,
+    search_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for name in &metadata.needed {
+        if should_skip_needed(name) || resolution_satisfies(resolved, name) {
+            continue;
+        }
+        if let Some(path) = find_needed_library(name, subject, search_paths) {
+            resolved.push(LibraryResolution {
+                name: name.clone(),
+                target: path,
+            });
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    missing
+}
+
+/// Locate `libfoo.so` beside the subject, on the linker search path, or in an immediate
+/// private subdirectory such as `pulseaudio/libpulsecommon-*.so`.
+fn find_needed_library(name: &str, subject: &Path, search_paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = subject.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.extend(search_paths.iter().cloned());
+    for dir in &dirs {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let parent = subject.parent()?;
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let candidate = entry.path().join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_magick_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    if text.contains("ImageMagick") {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("libMagick") || name == "magick" || name.starts_with("convert-im")
+        })
+}
+
+fn discover_imagemagick_modules(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for base in [
+        "usr/lib",
+        "usr/lib64",
+        "usr/local/lib",
+        "usr/lib/x86_64-linux-gnu",
+        "lib",
+        "lib64",
+    ] {
+        walk_magick_modules(&root.join(base), 0, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn walk_magick_modules(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > 7 || !dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk_magick_modules(&path, depth + 1, found);
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(".so") || name.contains(".so.") || name.ends_with(".la")) {
+            continue;
+        }
+        let text = path.to_string_lossy();
+        if text.contains("ImageMagick") && (text.contains("/coders/") || text.contains("/filters/"))
+        {
+            found.push(path);
+        }
     }
 }
 
@@ -1451,6 +1920,32 @@ fn should_record_alias(canonical: Option<&Path>, alias: &Path) -> bool {
     match canonical {
         Some(path) => path != alias,
         None => true,
+    }
+}
+
+fn record_soname_alias(
+    resolver: &dyn PathResolver,
+    aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    canonical: &Path,
+    needed_name: &str,
+    dest: &Path,
+) {
+    if needed_name.is_empty() {
+        return;
+    }
+    if let Some(logical) = resolver.host_to_logical(canonical) {
+        let mut runtime_alias = logical.path().to_path_buf();
+        if runtime_alias.file_name().and_then(|name| name.to_str()) != Some(needed_name) {
+            runtime_alias.set_file_name(needed_name);
+            record_alias(aliases, canonical, &runtime_alias);
+        }
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let alias_path = parent.join(needed_name);
+        if alias_path != dest {
+            record_alias(aliases, canonical, &alias_path);
+        }
     }
 }
 
@@ -1518,14 +2013,32 @@ fn classify_high_risk_asset(path: &Path) -> Option<&'static str> {
         }
     }
     if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
-        let lower = file.to_ascii_lowercase();
-        for prefix in GPU_LIB_PREFIXES {
-            if lower.starts_with(prefix) {
-                return Some("gpu-driver");
-            }
+        if is_gpu_library_name(file) {
+            return Some("gpu-driver");
         }
     }
     None
+}
+
+fn is_gpu_library_name(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "libgl.so",
+        "libglx",
+        "libgldispatch",
+        "libgles",
+        "libegl",
+        "libopengl",
+        "libopencl",
+        "libvulkan",
+        "libcuda",
+        "libnvidia",
+        "libdrm",
+        "libnvoptix",
+        "libopenvr",
+        "libxnvctrl",
+    ];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
 }
 
 #[derive(Debug, Error)]
@@ -1555,6 +2068,8 @@ pub enum ClosureError {
     LinkerTrace { path: PathBuf, source: LinkerError },
     #[error("no resolver registered for origin {origin:?}")]
     MissingResolver { origin: Origin },
+    #[error("{message}")]
+    EntryResolution { path: PathBuf, message: String },
 }
 
 #[cfg(test)]
@@ -1625,6 +2140,53 @@ mod tests {
     }
 
     #[test]
+    fn classify_does_not_treat_glib_as_a_gpu_library() {
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0")),
+            None
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libglibmm-2.4.so.1")),
+            None
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGL.so.1")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLX.so.0")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLdispatch.so.0")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLESv2.so.2")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/lib/x86_64-linux-gnu/libdrm.so.2")),
+            Some("gpu-driver")
+        );
+    }
+
+    #[test]
+    fn dt_needed_gpu_library_is_kept_when_traced_copies_are_not() {
+        let builder = ClosureBuilder::new();
+        let drm = Path::new("/usr/lib/x86_64-linux-gnu/libdrm.so.2");
+        let cuda = Path::new("/usr/lib/libcuda.so.1");
+        let glib = Path::new("/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0");
+        assert_eq!(builder.filter_reason(drm), Some("gpu-driver"));
+        assert_eq!(builder.filter_reason(glib), None);
+        assert!(!builder.skip_loaded_dependency(drm));
+        assert_eq!(builder.filter_reason(drm), None);
+        assert_eq!(builder.filter_reason(cuda), Some("gpu-driver"));
+        assert!(builder
+            .skip_loaded_dependency(Path::new("/usr/lib/glibc-hwcaps/x86-64-v3/libdrm.so.2")));
+    }
+
+    #[test]
     fn scan_bash_commands_finds_literal_invocations() {
         let script = Path::new("tests/fixtures/scip-java");
         let commands = ClosureBuilder::scan_bash_commands(script);
@@ -1654,5 +2216,160 @@ mod tests {
         let merged = map.get(Path::new("/etc/hosts")).expect("merged entry");
         assert!(merged.access.contains(TraceAccess::OPEN));
         assert!(merged.access.contains(TraceAccess::STAT));
+    }
+
+    #[test]
+    fn in_root_canonicalize_follows_alternatives_and_reports_dangling() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("usr/bin/convert-im6.q16");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"\x7fELF").unwrap();
+        let alternatives = root.path().join("etc/alternatives");
+        fs::create_dir_all(&alternatives).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/convert-im6.q16", alternatives.join("convert"))
+            .unwrap();
+        let bin = root.path().join("usr/bin");
+        std::os::unix::fs::symlink("/etc/alternatives/convert", bin.join("convert")).unwrap();
+
+        let resolved = canonicalize(Path::new("/usr/bin/convert"), Some(root.path())).unwrap();
+        assert_eq!(resolved, real);
+
+        let dangling_root = tempfile::tempdir().unwrap();
+        let dangling_bin = dangling_root.path().join("usr/bin");
+        fs::create_dir_all(&dangling_bin).unwrap();
+        std::os::unix::fs::symlink("/etc/alternatives/convert", dangling_bin.join("convert"))
+            .unwrap();
+        let err =
+            canonicalize(Path::new("/usr/bin/convert"), Some(dangling_root.path())).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("alternatives"),
+            "expected alternatives hint, got {message}"
+        );
+        assert!(
+            message.contains("convert-im6.q16"),
+            "expected real-path hint, got {message}"
+        );
+    }
+
+    #[test]
+    fn pg_wrapper_prefers_single_real_elf_and_lists_ambiguous_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let wrapper = root.path().join("usr/bin/psql");
+        fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        fs::write(&wrapper, b"#!/usr/bin/perl\nuse PgCommon;\n").unwrap();
+        let real = root.path().join("usr/lib/postgresql/17/bin/psql");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"\x7fELF").unwrap();
+
+        let chosen = prefer_real_elf(&wrapper, Some(root.path()), "psql").unwrap();
+        assert_eq!(chosen, real);
+
+        fs::create_dir_all(root.path().join("usr/lib/postgresql/16/bin")).unwrap();
+        fs::write(
+            root.path().join("usr/lib/postgresql/16/bin/psql"),
+            b"\x7fELF",
+        )
+        .unwrap();
+        let err = prefer_real_elf(&wrapper, Some(root.path()), "psql").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("multiple ELFs"), "{message}");
+        assert!(
+            message.contains("/usr/lib/postgresql/16/bin/psql"),
+            "{message}"
+        );
+        assert!(
+            message.contains("/usr/lib/postgresql/17/bin/psql"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn pg_wrapper_symlink_searches_the_entry_basename() {
+        let root = tempfile::tempdir().unwrap();
+        let script_dir = root.path().join("usr/share/postgresql-common");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("pg_wrapper");
+        fs::write(&script, b"#!/usr/bin/perl\nuse PgCommon;\n# pg_wrapper\n").unwrap();
+        let bin = root.path().join("usr/bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../share/postgresql-common/pg_wrapper", bin.join("psql"))
+            .unwrap();
+        let real = root.path().join("usr/lib/postgresql/17/bin/psql");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"\x7fELF").unwrap();
+
+        let resolved = canonicalize(Path::new("/usr/bin/psql"), Some(root.path())).unwrap();
+        assert!(resolved.ends_with("pg_wrapper"), "{}", resolved.display());
+        let chosen = prefer_real_elf(&resolved, Some(root.path()), "psql").unwrap();
+        assert_eq!(chosen, real);
+
+        let err = prefer_real_elf(&resolved, Some(root.path()), "pg_wrapper").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("/usr/lib/postgresql/<version>/bin/pg_wrapper"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn private_subdir_resolves_pulse_common_and_direct_needed() {
+        let root = tempfile::tempdir().unwrap();
+        let libdir = root.path().join("usr/lib/x86_64-linux-gnu");
+        let private = libdir.join("pulseaudio");
+        fs::create_dir_all(&private).unwrap();
+        let subject = libdir.join("libpulse.so.0");
+        fs::write(&subject, b"pulse").unwrap();
+        let common = private.join("libpulsecommon-16.1.so");
+        fs::write(&common, b"common").unwrap();
+
+        let found = find_needed_library("libpulsecommon-16.1.so", &subject, &[]).unwrap();
+        assert_eq!(found, common);
+
+        let glib = libdir.join("libglib-2.0.so.0");
+        fs::write(&glib, b"glib").unwrap();
+        let metadata = ElfMetadata {
+            interpreter: None,
+            needed: vec![
+                "libglib-2.0.so.0".into(),
+                "libpulsecommon-16.1.so".into(),
+                "linux-vdso.so.1".into(),
+            ],
+            rpaths: Vec::new(),
+            runpaths: Vec::new(),
+            soname: None,
+        };
+        let mut resolved = vec![LibraryResolution {
+            name: "libglib-2.0.so.0".into(),
+            target: glib.clone(),
+        }];
+        let missing = augment_resolutions(&mut resolved, &subject, &metadata, &[]);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(resolved.iter().any(|item| item.target == common));
+        assert!(resolved.iter().any(|item| item.target == glib));
+    }
+
+    #[test]
+    fn imagemagick_layout_collects_coder_modules_only() {
+        let root = tempfile::tempdir().unwrap();
+        let coder = root
+            .path()
+            .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders");
+        fs::create_dir_all(&coder).unwrap();
+        fs::write(coder.join("png.so"), b"png").unwrap();
+        fs::write(coder.join("png.la"), b"dlname='png.so'\n").unwrap();
+        let filter = root
+            .path()
+            .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/filters");
+        fs::create_dir_all(&filter).unwrap();
+        fs::write(filter.join("analyze.so"), b"filter").unwrap();
+        let unrelated = root.path().join("usr/lib/x86_64-linux-gnu/libfoo.so.1");
+        fs::write(&unrelated, b"foo").unwrap();
+
+        let found = discover_imagemagick_modules(root.path());
+        assert!(found.iter().any(|path| path.ends_with("png.so")));
+        assert!(found.iter().any(|path| path.ends_with("png.la")));
+        assert!(found.iter().any(|path| path.ends_with("analyze.so")));
+        assert!(!found.iter().any(|path| path.ends_with("libfoo.so.1")));
     }
 }

@@ -28,6 +28,11 @@ pub fn write_launchers(
         source,
     })?;
     set_exec_permissions(&launcher_path)?;
+    if option_env!("SIDEBUNDLE_LAUNCHER_STATIC") != Some("1") {
+        log::warn!(
+            "embedded launcher is dynamically linked against glibc and is not relocatable (matrix: true gnu / LAUNCH_FAIL / P0-3). Rebuild with the musl target or install it so packager embeds a static launcher. See docs/install.md"
+        );
+    }
 
     let config_dir = bundle_root.join(CONFIG_DIR);
     fs::create_dir_all(&config_dir).map_err(|source| PackagerError::Io {

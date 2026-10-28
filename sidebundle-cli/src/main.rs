@@ -30,6 +30,7 @@ use sidebundle_core::{
 use sidebundle_packager::Packager;
 
 mod agent;
+mod portable_data;
 use agent::{AgentLaunchConfig, AgentRunResult, AgentTraceRunner};
 
 fn main() {
@@ -200,6 +201,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .context("failed to backfill system assets")?;
     add_copy_dirs(&mut closure, &copy_dir, &resolver_entries)
         .context("failed to apply --copy-dir entries")?;
+    let origin_roots = collect_origin_roots(&closure, &resolver_entries);
+    portable_data::inject_portable_data(&mut closure, &origin_roots)
+        .context("failed to inject portable data prefixes")?;
     apply_env_overrides(&mut closure, &set_env);
     sanitize_symlinks(&mut closure);
 
@@ -1293,7 +1297,8 @@ fn build_agent_image_closure(args: BuildAgentImageArgs) -> Result<ImageClosureRe
     );
     for entry in entries {
         let host_path = physical_image_path(rootfs.path(), &entry.path);
-        if let Err(err) = std::fs::metadata(&host_path) {
+        // lstat: an absolute alternatives symlink must not be followed onto the host.
+        if let Err(err) = std::fs::symlink_metadata(&host_path) {
             warn!(
                 "agent: entry {} missing from exported rootfs at {} ({err})",
                 entry.path.display(),
@@ -1351,13 +1356,15 @@ fn build_closure_from_root(args: BuildFromRootArgs) -> Result<ImageClosureResult
     let origin = Origin::Image(reference.to_string());
     for (idx, entry_spec) in entries.iter().enumerate() {
         let physical = physical_image_path(&rootfs, &entry_spec.path);
-        std::fs::metadata(&physical).with_context(|| {
-            format!(
-                "image `{reference}` missing executable {} (resolved path {})",
-                entry_spec.path.display(),
-                physical.display()
-            )
-        })?;
+        if !image_entry_present(&rootfs, &entry_spec.path) {
+            std::fs::symlink_metadata(&physical).with_context(|| {
+                format!(
+                    "image `{reference}` missing executable {} (resolved path {})",
+                    entry_spec.path.display(),
+                    physical.display()
+                )
+            })?;
+        }
         let display = entry_spec
             .path
             .file_name()
@@ -1538,6 +1545,15 @@ fn physical_image_path(rootfs: &Path, virtual_path: &Path) -> PathBuf {
     rootfs.join(relative)
 }
 
+/// True when the entry inode exists inside the image root.
+///
+/// `metadata` follows symlinks. `/usr/bin/convert` → `/etc/alternatives/convert`
+/// is absolute, so that call leaves the rootfs and reports the executable missing
+/// before in-root resolution can reach `convert-im6.q16`.
+fn image_entry_present(rootfs: &Path, virtual_path: &Path) -> bool {
+    fs::symlink_metadata(physical_image_path(rootfs, virtual_path)).is_ok()
+}
+
 fn configure_image_trace_backend(
     arg: TraceBackendArg,
     _backend: BackendPreference,
@@ -1705,15 +1721,18 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
         return;
     }
     let overrides: BTreeMap<String, String> = overrides.iter().cloned().collect();
-    for snapshot in closure.metadata.values_mut() {
-        snapshot.env.extend(overrides.clone());
-    }
-    for origin in closure.entry_plans.iter().map(|p| p.origin().clone()) {
+    let mut origins: Vec<Origin> = closure.metadata.keys().cloned().collect();
+    origins.extend(closure.entry_plans.iter().map(|plan| plan.origin().clone()));
+    let mut seen = HashSet::new();
+    for origin in origins {
+        if !seen.insert(origin.clone()) {
+            continue;
+        }
         closure
             .metadata
-            .entry(origin.clone())
+            .entry(origin)
             .or_default()
-            .env
+            .env_overrides
             .extend(overrides.clone());
     }
 }
@@ -1854,7 +1873,29 @@ fn capture_runtime_metadata() -> Result<RuntimeMetadata> {
         uname,
         platform,
         random,
+        ..RuntimeMetadata::default()
     })
+}
+
+fn collect_origin_roots(
+    closure: &DependencyClosure,
+    resolvers: &[(Origin, Arc<dyn PathResolver>)],
+) -> Vec<(Origin, PathBuf)> {
+    let mut roots: Vec<(Origin, PathBuf)> = Vec::new();
+    let mut seen = HashSet::new();
+    for plan in &closure.entry_plans {
+        let origin = plan.origin().clone();
+        if !seen.insert(origin.clone()) {
+            continue;
+        }
+        let root = resolvers
+            .iter()
+            .find(|(candidate, _)| candidate == &origin)
+            .and_then(|(_, resolver)| resolver.trace_root().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        roots.push((origin, root));
+    }
+    roots
 }
 
 fn read_auxv_entries() -> Result<Vec<AuxvEntry>> {
@@ -2052,6 +2093,44 @@ mod tests {
             closure.symlinks[0].bundle_target,
             PathBuf::from("payload/w")
         );
+    }
+
+    #[test]
+    fn image_entry_precheck_keeps_in_root_alternatives_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("usr/bin/convert-im6.q16");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"\x7fELF").unwrap();
+        let alternatives = root.path().join("etc/alternatives");
+        fs::create_dir_all(&alternatives).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/convert-im6.q16", alternatives.join("convert"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            "/etc/alternatives/convert",
+            root.path().join("usr/bin/convert"),
+        )
+        .unwrap();
+
+        let physical = physical_image_path(root.path(), Path::new("/usr/bin/convert"));
+        match fs::metadata(&physical) {
+            Err(_) => {}
+            Ok(_) => {
+                let escaped = fs::canonicalize(&physical).unwrap();
+                assert!(
+                    !escaped.starts_with(root.path()),
+                    "metadata followed the alternatives link out of the image: {}",
+                    escaped.display()
+                );
+            }
+        }
+        assert!(image_entry_present(
+            root.path(),
+            Path::new("/usr/bin/convert")
+        ));
+        assert!(!image_entry_present(
+            root.path(),
+            Path::new("/usr/bin/convert-missing")
+        ));
     }
 }
 #[derive(Subcommand)]

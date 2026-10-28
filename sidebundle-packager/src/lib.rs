@@ -212,6 +212,11 @@ impl Packager {
                 }
                 Err(e) => return Err(e),
             }
+            // libltdl opens `libdir/dlname` when installed=yes. Debian `.la` files
+            // name the image's absolute module dir, so a host that has ImageMagick
+            // installed would load the host coder. Rewrite after the link so the
+            // content store keeps the original text.
+            rewrite_shipped_libtool_archive(&dest_path)?;
             manifest_files.push(ManifestFile {
                 origin: FileOrigin::Dependency,
                 source: source_path.display().to_string(),
@@ -505,6 +510,59 @@ fn store_in_data(data_dir: &Path, source: &Path, digest: &str) -> Result<PathBuf
     })?;
     copy_permissions(&source, &stored).ok();
     Ok(stored)
+}
+
+fn rewrite_shipped_libtool_archive(dest: &Path) -> Result<(), PackagerError> {
+    let Some(name) = dest.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    if !name.ends_with(".la") {
+        return Ok(());
+    }
+    let bytes = fs::read(dest).map_err(|source| PackagerError::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(());
+    };
+    if !text.contains("libdir=") && !text.contains("installed=") {
+        return Ok(());
+    }
+    let rewritten = rewrite_la_text(text);
+    if rewritten.as_bytes() == bytes {
+        return Ok(());
+    }
+    fs::remove_file(dest).map_err(|source| PackagerError::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    fs::write(dest, rewritten).map_err(|source| PackagerError::Io {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Point a packed libtool archive at the directory that contains the `.la`.
+///
+/// `installed=no` skips the absolute `libdir` open. The sentinel `libdir` is not
+/// a real path, so a leftover `installed=yes` also misses and ltdl falls back to
+/// `dir/dlname` (the payload directory of the `.la`).
+fn rewrite_la_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("libdir=") {
+            out.push_str("libdir='/sidebundle-relocated'\n");
+        } else if trimmed.starts_with("installed=") {
+            out.push_str("installed=no\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), PackagerError> {
@@ -958,6 +1016,41 @@ mod tests {
         let target_abs = Path::new("/bundle/payload/usr/lib/java/bin/java");
         let rel = relative_symlink_target(dest_parent, target_abs);
         assert_eq!(rel, PathBuf::from("../lib/java/bin/java"));
+    }
+
+    #[test]
+    fn rewrite_la_text_drops_host_libdir() {
+        let input = "\
+# jpeg.la
+dlname='jpeg.so'
+library_names='jpeg.so jpeg.so jpeg.so'
+installed=yes
+libdir='/usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders'
+";
+        let rewritten = rewrite_la_text(input);
+        assert!(rewritten.contains("dlname='jpeg.so'\n"));
+        assert!(rewritten.contains("installed=no\n"));
+        assert!(rewritten.contains("libdir='/sidebundle-relocated'\n"));
+        assert!(!rewritten.contains("/usr/lib"));
+    }
+
+    #[test]
+    fn rewrite_la_replaces_hardlinked_payload_copy() {
+        let dir = tempdir().unwrap();
+        let stored = dir.path().join("store.la");
+        let original = "dlname='jpeg.so'\nlibdir='/usr/lib/coders'\ninstalled=yes\n";
+        fs::write(&stored, original).unwrap();
+        let dest = dir.path().join("jpeg.la");
+        fs::hard_link(&stored, &dest).unwrap();
+        rewrite_shipped_libtool_archive(&dest).unwrap();
+        assert_eq!(fs::read_to_string(&stored).unwrap(), original);
+        let rewritten = fs::read_to_string(&dest).unwrap();
+        assert!(rewritten.contains("installed=no\n"), "{rewritten}");
+        assert!(
+            rewritten.contains("libdir='/sidebundle-relocated'\n"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("/usr/lib"));
     }
 
     #[test]
