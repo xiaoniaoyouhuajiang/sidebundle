@@ -65,15 +65,16 @@
 - `ld.so --list` 非 0 退出但 stdout 里已有解析结果时，保留已解析项和 `=> not found` 名单。
 - 对当前 ELF 的 `DT_NEEDED`，在主体目录、搜索路径，以及主体目录的**一层**子目录（`pulseaudio/`）里按文件名查找。找到才继续，直接依赖仍缺失则失败。
 - 队列本身继续递归，因此 liblqr 的 `libglib` 会在处理 liblqr 时补上，而不是在父 ELF 的一次 `ld.so` 输出不完整时整包失败。
-- 闭包里出现 ImageMagick / `libMagick*` 时，在 origin 根下收集 `ImageMagick…/modules-*/coders|filters/*.so`，收入 payload 并尽量解析其 NEEDED。单个 coder 解析失败只警告，不让整包失败。
+- 闭包里出现 ImageMagick / `libMagick*` 时，在 origin 根下收集 `ImageMagick…/modules-*/coders|filters` 的 `*.so` **和**同目录 `*.la`（IM6 libltdl 通过 `.la` 加载），收入 payload 并尽量解析其 NEEDED。`.la` 不是 ELF，解析直接跳过。单个 coder 解析失败只警告，不让整包失败。只从模块 NEEDED 拉进来的库（例如 `libjpeg.so.62.3.0`）补一条 soname 文件名别名（`libjpeg.so.62`）。
 
 ### P1-B 入口解引用（矩阵：imagemagick `/usr/bin/convert` IMAGE_PATH；psql pg_wrapper IMAGE_PATH）
 
 **实现**：
 
 - 有 root 时不再用 `fs::canonicalize` 追绝对符号链接。在 root 内逐级 `readlink`，`/usr/bin/convert` → `/etc/alternatives/convert` → `/usr/bin/convert-im6.q16` 会落到镜像内的真实文件。
+- CLI 在闭包之前用 `symlink_metadata`（lstat）确认入口在镜像根里。`metadata` 会顺着绝对 alternatives 链跑到宿主机，于是在闭包错误出现之前就报 `missing executable /usr/bin/convert`。
 - 链在 root 内断开时，错误信息点名 alternatives，并提示 ImageMagick 常见真实路径 `/usr/bin/convert-im6.q16`。
-- 内容像 `pg_wrapper` / `PgCommon` 的脚本：若 `usr/lib/postgresql/*/bin/<同名>` 恰好有一个 ELF，改用它并警告；多个则报错列出路径；零个则报错提示 `/usr/lib/postgresql/<version>/bin/<tool>`。
+- 内容像 `pg_wrapper` / `PgCommon` 的脚本：在 `usr/lib/postgresql/*/bin/` 下按**用户入口 basename** 找 ELF（`/usr/bin/psql` → `psql`，不是解析后的 `pg_wrapper`）。恰好一个则改用它并警告；多个则报错列出路径；零个则报错提示 `/usr/lib/postgresql/<version>/bin/<入口名>`。
 
 ### P1-C CHILD_EXEC（矩阵：semgrep）— 本期不做
 
@@ -100,13 +101,25 @@ git templates/libexec、Python stdlib、semgrep site-packages 仍依赖 `--copy-
 | curl-setenv | PASS，且 `-e HTTPS_PROXY=...` 不再被 metadata 整表丢掉。`${SIDEBUNDLE_ROOT}` 会展开。 |
 | tesseract | `--list-langs` 含 eng，无需手改 launcher JSON。调用方已设置的 `TESSDATA_PREFIX` 仍优先。 |
 | true (gnu 开发构建) | 安装 musl target 后，嵌入 launcher 无 `PT_INTERP`，centos:7 不再因 launcher 的 glibc 失败。未安装 musl target 时构建会警告。发布物本来就是 musl，保持 PASS。 |
-| ffmpeg debian | 私有 `pulseaudio/` 不再使 PACK 因 `libpulsecommon` 失败。单测覆盖该查找。运行时 wav→mp3 仍建议用已 PASS 的 jrottenberg 镜像对照。 |
-| imagemagick `/usr/bin/convert` | alternatives 链在镜像根内可解析时 PACK 成功，入口名仍是 `convert`。链断开时错误信息给出 `convert-im6.q16`。 |
-| imagemagick convert-im6.q16 | coder 模块与传递 NEEDED 进入闭包。是否在 centos 上完成 png→jpg 取决于模块是否被启发式扫到以及是否混链；单测锁定「coders/filters 被收集」和「私有目录 / 传递 NEEDED 文件名查找」。 |
-| psql pg_wrapper | 唯一的 `…/bin/psql` ELF 会被自动选中（矩阵里真实 ELF 行已经全绿）。多个版本时报出路径列表。 |
+| ffmpeg debian | 默认打包（无 `--allow-gpu-libs`）包含 `libglib-2.0.so.*`，以及 codec 路径上 DT_NEEDED 的 `libdrm` / `libGLX` / `libGLdispatch` / `libvulkan`。trace 到、但不是 DT_NEEDED 的 GPU 驱动仍过滤。期望 centos:7 与 ubuntu 18.04 上 wav→mp3 通过。**待父进程 Docker 复检，本文不标绿。** |
+| imagemagick `/usr/bin/convert` | 镜像根内 alternatives 链能到达 `convert-im6.q16` 时 PACK 成功，入口名仍是 `convert`。预检不再因为绝对符号链接逃出 rootfs 而失败。链断开时错误信息给出 `convert-im6.q16`。**待 Docker 复检。** |
+| imagemagick convert-im6.q16 | 收集 coder/filter `.so` 与同目录 `.la`；复制含 `delegates.xml` 的 ImageMagick-6 配置；写入可展开的 `MAGICK_CONFIGURE_PATH` / `MAGICK_CODER_MODULE_PATH` / `MAGICK_FILTER_MODULE_PATH`；补 jpeg 等 soname 链接；打包时把 `.la` 改成 `installed=no` 且 `libdir` 不再指向宿主绝对路径。期望 png→jpg 写出 JPEG（`ffd8`），不手改 launcher JSON。**待 Docker 复检。** |
+| psql pg_wrapper | `/usr/bin/psql` → `pg_wrapper` 时按入口名 `psql` 搜索，选中唯一的 `/usr/lib/postgresql/<ver>/bin/psql`。显示名仍是 `psql`。**待 Docker 复检。** |
 | semgrep | **仍 FAIL**（CHILD_EXEC）。不把 PASS* 的手工 chroot 当成产品行为。 |
 
-单元测试：launcher 的环境合并与 `${SIDEBUNDLE_ROOT}` / 相对路径展开；closure 的 alternatives、pg_wrapper、pulse 私有库、ImageMagick 模块目录；CLI 的 CA / tessdata 注入。
+单元测试：launcher 的环境合并、`${SIDEBUNDLE_ROOT}` 展开，以及从 payload 补 MAGICK_*；closure 的 glib/GPU 分类、DT_NEEDED GPU 例外、alternatives、`psql`→`pg_wrapper` 的入口名搜索、pulse 私有库、ImageMagick `.so`+`.la`；CLI 的 CA / tessdata / ImageMagick 配置注入，以及 convert 的 lstat 预检；packager 的 `.la` 改写不改内容库。
+
+## 复检缺口（本地 Docker 矩阵，当时 head `fa7bc69`）
+
+权威笔记是本地重跑，不是本仓库里的 CI。那次有几行预期变绿但没有：ffmpeg 默认运行缺 `libglib-2.0` / `libdrm` / `libGLX` / `libGLdispatch` / `libvulkan`（`--allow-gpu-libs` 已能 wav→mp3）；`/usr/bin/convert` 在闭包之前 PACK_FAIL；`/usr/bin/psql` 按 `pg_wrapper` 去找 ELF；`convert-im6.q16` 即使允许 GPU 库，png→jpg 仍不是 JPEG（0 个 `.la`、配置不全、没有 MAGICK_*、缺 `libjpeg.so.62` soname）。
+
+对应改动（单测已锁，**Docker 矩阵仍等父进程重跑**）：
+
+- GPU 文件名不再用前缀 `libgl`（那会命中 `libglib-2.0` / `libglibmm`）。匹配 `libGL.so`、`libGLX`、`libGLdispatch`、`libGLES`、`libEGL`、`libdrm`、`libvulkan` 等真实名字。
+- 动态链接器的 DT_NEEDED 若被标成 gpu-driver，仍然打进包；只在 trace 里出现的 GPU 文件继续丢掉，除非 `--allow-gpu-libs`。这是默认 ffmpeg 能启动的最小例外。`glibc-hwcaps` 仍然排除。
+- ImageMagick 6：配置目录进 payload，launcher 在调用方没设置时补 MAGICK_*（`${SIDEBUNDLE_ROOT}` 会展开）。打包后的 `.la` 写成 `installed=no`、`libdir='/sidebundle-relocated'`，libltdl 才会从 `.la` 旁边加载 `dlname`，而不是去宿主的 `/usr/lib/.../coders`。
+
+curl-host、curl-setenv、tesseract、true gnu、ffmpeg PACK 在那次重跑里已经是绿的，这次不改它们的产品路径。semgrep 仍不做。
 
 ## 明确不做
 
