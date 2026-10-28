@@ -44,21 +44,8 @@ const DEFAULT_SHEBANG_PATHS: &[&str] = &[
 const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
 const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
 const GLIBC_HWCAPS_SEGMENT: &str = "glibc-hwcaps";
-const GPU_LIB_PREFIXES: &[&str] = &[
-    "libgl",
-    "libgldispatch",
-    "libglx",
-    "libegl",
-    "libgles",
-    "libopencl",
-    "libvulkan",
-    "libcuda",
-    "libnvidia",
-    "libdrm",
-    "libnvoptix",
-    "libopenvr",
-    "libxnvctrl",
-];
+// Real GL/GLES/GLX/EGL sonames are matched in `is_gpu_library_name`. A bare
+// `libgl` prefix also matches `libglib-2.0` and `libglibmm`.
 
 const HOST_GLIBC_LINKERS: &[&str] = &[
     "/lib64/ld-linux-x86-64.so.2",
@@ -283,6 +270,10 @@ pub struct ClosureBuilder {
     default_paths: Vec<PathBuf>,
     origin_paths: HashMap<Origin, Vec<PathBuf>>,
     scanned_scripts: RefCell<HashSet<PathBuf>>,
+    /// DT_NEEDED paths that must ship even when they look like GPU libraries.
+    /// The dynamic linker cannot start ffmpeg without libdrm/libGLX; dlopen'd
+    /// driver files that are not in this set stay filtered.
+    load_time_deps: RefCell<HashSet<PathBuf>>,
     allow_gpu_libs: bool,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
@@ -300,6 +291,7 @@ impl ClosureBuilder {
             default_paths: DEFAULT_LIBRARY_DIRS.iter().map(PathBuf::from).collect(),
             origin_paths: HashMap::new(),
             scanned_scripts: RefCell::new(HashSet::new()),
+            load_time_deps: RefCell::new(HashSet::new()),
             allow_gpu_libs: false,
             runner: LinkerRunner::new(),
             tracer: None,
@@ -673,7 +665,8 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_source = self.canonical_entry_path(resolver, &entry.logical)?;
-        let entry_source = prefer_real_elf(&entry_source, resolver.trace_root())?;
+        let entry_source =
+            prefer_real_elf(&entry_source, resolver.trace_root(), &entry.display_name)?;
         let mut state = PlanState::new(files, aliases, cache);
         self.build_entry_plan(
             resolver,
@@ -801,11 +794,12 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
-                if let Some(reason) = self.filter_reason(&canonical) {
+                if self.skip_loaded_dependency(&canonical) {
                     debug!(
-                        "skipping dependency {} for {} ({reason})",
+                        "skipping dependency {} for {} ({})",
                         canonical.display(),
-                        current.display()
+                        current.display(),
+                        classify_high_risk_asset(&canonical).unwrap_or("filtered")
                     );
                     continue;
                 }
@@ -821,16 +815,8 @@ impl ClosureBuilder {
                 );
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
-                    let mut alias_path = dir.to_path_buf();
-                    alias_path.push(&resolution.name);
-                    if let Some(logical) = resolver.host_to_logical(&canonical) {
-                        let mut runtime_alias = logical.path().to_path_buf();
-                        runtime_alias.set_file_name(&resolution.name);
-                        record_alias(state.aliases, &canonical, &runtime_alias);
-                    } else if alias_path != dest {
-                        record_alias(state.aliases, &canonical, &alias_path);
-                    }
                 }
+                record_soname_alias(resolver, state.aliases, &canonical, &resolution.name, &dest);
                 queue.push_back(canonical);
             }
         }
@@ -1170,8 +1156,26 @@ impl ClosureBuilder {
 
     fn filter_reason(&self, path: &Path) -> Option<&'static str> {
         match classify_high_risk_asset(path) {
-            Some("gpu-driver") if self.allow_gpu_libs => None,
+            Some("gpu-driver")
+                if self.allow_gpu_libs || self.load_time_deps.borrow().contains(path) =>
+            {
+                None
+            }
             other => other,
+        }
+    }
+
+    /// glibc-hwcaps stays out. A GPU-looking DT_NEEDED (libdrm, libGLX, …) is
+    /// recorded and kept: the loader needs it before main. Traced dlopen hits
+    /// are still dropped unless `--allow-gpu-libs` is set.
+    fn skip_loaded_dependency(&self, path: &Path) -> bool {
+        match classify_high_risk_asset(path) {
+            Some("gpu-driver") => {
+                self.load_time_deps.borrow_mut().insert(path.to_path_buf());
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -1390,6 +1394,10 @@ impl ClosureBuilder {
             }
             let metadata = match self.load_metadata(&current, state.cache) {
                 Ok(metadata) => metadata.clone(),
+                Err(ClosureError::ElfParse {
+                    source: ElfParseError::NotElf { .. },
+                    ..
+                }) => continue,
                 Err(err) => {
                     warn!("skipping ImageMagick module {}: {err}", current.display());
                     continue;
@@ -1425,10 +1433,11 @@ impl ClosureBuilder {
                         continue;
                     }
                 };
-                if let Some(reason) = self.filter_reason(&canonical) {
+                if self.skip_loaded_dependency(&canonical) {
                     debug!(
-                        "skipping ImageMagick dependency {} ({reason})",
-                        canonical.display()
+                        "skipping ImageMagick dependency {} ({})",
+                        canonical.display(),
+                        classify_high_risk_asset(&canonical).unwrap_or("filtered")
                     );
                     continue;
                 }
@@ -1436,6 +1445,7 @@ impl ClosureBuilder {
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
                 }
+                record_soname_alias(resolver, state.aliases, &canonical, &resolution.name, &dest);
                 queue.push_back(canonical);
             }
         }
@@ -1633,19 +1643,22 @@ fn dangling_entry_error(
     }
 }
 
-fn prefer_real_elf(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureError> {
+fn prefer_real_elf(
+    path: &Path,
+    root: Option<&Path>,
+    entry_name: &str,
+) -> Result<PathBuf, ClosureError> {
     if parse_elf_metadata(path).is_ok() {
         return Ok(path.to_path_buf());
     }
     if !looks_like_pg_wrapper(path) {
         return Ok(path.to_path_buf());
     }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("psql");
+    // `/usr/bin/psql` is a relative symlink to `pg_wrapper`. Search with the
+    // name the user asked for, not the script's own filename.
+    let name = entry_tool_name(path, entry_name);
     let root = root.unwrap_or_else(|| Path::new("/"));
-    let matches = find_postgresql_elfs(root, name);
+    let matches = find_postgresql_elfs(root, &name);
     match matches.len() {
         1 => {
             warn!(
@@ -1677,6 +1690,17 @@ fn prefer_real_elf(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureE
             })
         }
     }
+}
+
+fn entry_tool_name(path: &Path, entry_name: &str) -> String {
+    let trimmed = entry_name.trim();
+    if !trimmed.is_empty() && !trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("psql")
+        .to_string()
 }
 
 fn looks_like_pg_wrapper(path: &Path) -> bool {
@@ -1838,7 +1862,7 @@ fn walk_magick_modules(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !(name.ends_with(".so") || name.contains(".so.")) {
+        if !(name.ends_with(".so") || name.contains(".so.") || name.ends_with(".la")) {
             continue;
         }
         let text = path.to_string_lossy();
@@ -1896,6 +1920,32 @@ fn should_record_alias(canonical: Option<&Path>, alias: &Path) -> bool {
     match canonical {
         Some(path) => path != alias,
         None => true,
+    }
+}
+
+fn record_soname_alias(
+    resolver: &dyn PathResolver,
+    aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    canonical: &Path,
+    needed_name: &str,
+    dest: &Path,
+) {
+    if needed_name.is_empty() {
+        return;
+    }
+    if let Some(logical) = resolver.host_to_logical(canonical) {
+        let mut runtime_alias = logical.path().to_path_buf();
+        if runtime_alias.file_name().and_then(|name| name.to_str()) != Some(needed_name) {
+            runtime_alias.set_file_name(needed_name);
+            record_alias(aliases, canonical, &runtime_alias);
+        }
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let alias_path = parent.join(needed_name);
+        if alias_path != dest {
+            record_alias(aliases, canonical, &alias_path);
+        }
     }
 }
 
@@ -1963,14 +2013,32 @@ fn classify_high_risk_asset(path: &Path) -> Option<&'static str> {
         }
     }
     if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
-        let lower = file.to_ascii_lowercase();
-        for prefix in GPU_LIB_PREFIXES {
-            if lower.starts_with(prefix) {
-                return Some("gpu-driver");
-            }
+        if is_gpu_library_name(file) {
+            return Some("gpu-driver");
         }
     }
     None
+}
+
+fn is_gpu_library_name(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "libgl.so",
+        "libglx",
+        "libgldispatch",
+        "libgles",
+        "libegl",
+        "libopengl",
+        "libopencl",
+        "libvulkan",
+        "libcuda",
+        "libnvidia",
+        "libdrm",
+        "libnvoptix",
+        "libopenvr",
+        "libxnvctrl",
+    ];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
 }
 
 #[derive(Debug, Error)]
@@ -2072,6 +2140,53 @@ mod tests {
     }
 
     #[test]
+    fn classify_does_not_treat_glib_as_a_gpu_library() {
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0")),
+            None
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libglibmm-2.4.so.1")),
+            None
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGL.so.1")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLX.so.0")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLdispatch.so.0")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/usr/lib/libGLESv2.so.2")),
+            Some("gpu-driver")
+        );
+        assert_eq!(
+            classify_high_risk_asset(Path::new("/lib/x86_64-linux-gnu/libdrm.so.2")),
+            Some("gpu-driver")
+        );
+    }
+
+    #[test]
+    fn dt_needed_gpu_library_is_kept_when_traced_copies_are_not() {
+        let builder = ClosureBuilder::new();
+        let drm = Path::new("/usr/lib/x86_64-linux-gnu/libdrm.so.2");
+        let cuda = Path::new("/usr/lib/libcuda.so.1");
+        let glib = Path::new("/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0");
+        assert_eq!(builder.filter_reason(drm), Some("gpu-driver"));
+        assert_eq!(builder.filter_reason(glib), None);
+        assert!(!builder.skip_loaded_dependency(drm));
+        assert_eq!(builder.filter_reason(drm), None);
+        assert_eq!(builder.filter_reason(cuda), Some("gpu-driver"));
+        assert!(builder
+            .skip_loaded_dependency(Path::new("/usr/lib/glibc-hwcaps/x86-64-v3/libdrm.so.2")));
+    }
+
+    #[test]
     fn scan_bash_commands_finds_literal_invocations() {
         let script = Path::new("tests/fixtures/scip-java");
         let commands = ClosureBuilder::scan_bash_commands(script);
@@ -2147,7 +2262,7 @@ mod tests {
         fs::create_dir_all(real.parent().unwrap()).unwrap();
         fs::write(&real, b"\x7fELF").unwrap();
 
-        let chosen = prefer_real_elf(&wrapper, Some(root.path())).unwrap();
+        let chosen = prefer_real_elf(&wrapper, Some(root.path()), "psql").unwrap();
         assert_eq!(chosen, real);
 
         fs::create_dir_all(root.path().join("usr/lib/postgresql/16/bin")).unwrap();
@@ -2156,7 +2271,7 @@ mod tests {
             b"\x7fELF",
         )
         .unwrap();
-        let err = prefer_real_elf(&wrapper, Some(root.path())).unwrap_err();
+        let err = prefer_real_elf(&wrapper, Some(root.path()), "psql").unwrap_err();
         let message = err.to_string();
         assert!(message.contains("multiple ELFs"), "{message}");
         assert!(
@@ -2165,6 +2280,34 @@ mod tests {
         );
         assert!(
             message.contains("/usr/lib/postgresql/17/bin/psql"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn pg_wrapper_symlink_searches_the_entry_basename() {
+        let root = tempfile::tempdir().unwrap();
+        let script_dir = root.path().join("usr/share/postgresql-common");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("pg_wrapper");
+        fs::write(&script, b"#!/usr/bin/perl\nuse PgCommon;\n# pg_wrapper\n").unwrap();
+        let bin = root.path().join("usr/bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../share/postgresql-common/pg_wrapper", bin.join("psql"))
+            .unwrap();
+        let real = root.path().join("usr/lib/postgresql/17/bin/psql");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"\x7fELF").unwrap();
+
+        let resolved = canonicalize(Path::new("/usr/bin/psql"), Some(root.path())).unwrap();
+        assert!(resolved.ends_with("pg_wrapper"), "{}", resolved.display());
+        let chosen = prefer_real_elf(&resolved, Some(root.path()), "psql").unwrap();
+        assert_eq!(chosen, real);
+
+        let err = prefer_real_elf(&resolved, Some(root.path()), "pg_wrapper").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("/usr/lib/postgresql/<version>/bin/pg_wrapper"),
             "{message}"
         );
     }
@@ -2214,6 +2357,7 @@ mod tests {
             .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders");
         fs::create_dir_all(&coder).unwrap();
         fs::write(coder.join("png.so"), b"png").unwrap();
+        fs::write(coder.join("png.la"), b"dlname='png.so'\n").unwrap();
         let filter = root
             .path()
             .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/filters");
@@ -2224,6 +2368,7 @@ mod tests {
 
         let found = discover_imagemagick_modules(root.path());
         assert!(found.iter().any(|path| path.ends_with("png.so")));
+        assert!(found.iter().any(|path| path.ends_with("png.la")));
         assert!(found.iter().any(|path| path.ends_with("analyze.so")));
         assert!(!found.iter().any(|path| path.ends_with("libfoo.so.1")));
     }
