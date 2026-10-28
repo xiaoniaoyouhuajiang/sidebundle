@@ -227,7 +227,9 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
     let mut report = TraceReport::default();
     let root = child;
     let mut tracker = TraceeTracker::new(root);
-    let mut entering: HashMap<Pid, bool> = HashMap::new();
+    // Enter vs exit is decided from rax inside handle_syscall (x86_64 entry
+    // leaves ax = -ENOSYS). A per-thread toggle is wrong for tasks created by
+    // clone: the first syscall-stop may be the creating syscall's exit.
     let mut pending: HashMap<Pid, PendingSyscall> = HashMap::new();
 
     fn ensure_options(pid: Pid) -> Result<(), TraceError> {
@@ -253,23 +255,15 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
         match waitpid(None, Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::Stopped(pid, Signal::SIGSTOP)) => {
                 tracker.ensure_tracee(pid);
-                entering.entry(pid).or_insert(true);
                 ensure_options(pid)?;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
             Ok(WaitStatus::PtraceSyscall(pid)) => {
                 tracker.ensure_tracee(pid);
-                let entry = entering.entry(pid).or_insert(true);
-                debug!(
-                    "ptrace: syscall stop pid={} entering={}",
-                    pid.as_raw(),
-                    *entry
-                );
-                if let Err(err) = handle_syscall(pid, *entry, &mut pending, &mut report) {
+                if let Err(err) = handle_syscall(pid, &mut pending, &mut report) {
                     ptrace::detach(pid, None).ok();
                     return Err(err);
                 }
-                *entry = !*entry;
                 ptrace::syscall(pid, None).map_err(TraceError::Nix)?;
             }
             Ok(WaitStatus::PtraceEvent(pid, _, event)) => {
@@ -282,7 +276,6 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
                     if let Ok(raw) = ptrace::getevent(pid) {
                         let new_pid = Pid::from_raw(raw as i32);
                         tracker.ensure_tracee(new_pid);
-                        entering.entry(new_pid).or_insert(true);
                         let event_name = if event == libc::PTRACE_EVENT_CLONE {
                             "clone"
                         } else if event == libc::PTRACE_EVENT_VFORK {
@@ -314,7 +307,6 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             }
             Ok(WaitStatus::Exited(pid, status)) => {
                 tracker.on_exit(pid, Some(status));
-                entering.remove(&pid);
                 pending.remove(&pid);
                 if tracker.is_done() {
                     return match tracker.root_status() {
@@ -328,7 +320,6 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             }
             Ok(WaitStatus::Signaled(pid, _sig, _)) => {
                 tracker.on_exit(pid, None);
-                entering.remove(&pid);
                 pending.remove(&pid);
                 if tracker.is_done() {
                     if pid == root {
@@ -341,7 +332,6 @@ unsafe fn parent_trace(child: Pid) -> Result<TraceReport, TraceError> {
             Ok(WaitStatus::Continued(_)) => {}
             Ok(WaitStatus::Stopped(pid, sig)) => {
                 tracker.ensure_tracee(pid);
-                entering.entry(pid).or_insert(true);
                 ensure_options(pid)?;
                 let mut forward = None;
                 if sig != Signal::SIGTRAP && sig != Signal::SIGSTOP {
@@ -493,14 +483,13 @@ fn record_fanotify_event(event: &nix::sys::fanotify::FanotifyEvent, report: &mut
 #[cfg(target_arch = "x86_64")]
 fn handle_syscall(
     pid: Pid,
-    entering: bool,
     pending: &mut HashMap<Pid, PendingSyscall>,
     report: &mut TraceReport,
 ) -> Result<(), TraceError> {
     let regs = ptrace::getregs(pid).map_err(TraceError::Nix)?;
     let syscall = regs.orig_rax as i64;
 
-    handle_syscall_regs(pid, entering, syscall, &regs, pending, report, |addr| {
+    handle_syscall_regs(pid, syscall, &regs, pending, report, |addr| {
         read_string(pid, addr)
     })
 }
@@ -508,64 +497,80 @@ fn handle_syscall(
 #[cfg(target_arch = "x86_64")]
 fn handle_syscall_regs(
     pid: Pid,
-    entering: bool,
     syscall: i64,
     regs: &libc::user_regs_struct,
     pending: &mut HashMap<Pid, PendingSyscall>,
     report: &mut TraceReport,
     mut read_path: impl FnMut(usize) -> Result<String, TraceError>,
 ) -> Result<(), TraceError> {
-    if entering {
-        if syscall == libc::SYS_execve {
-            // execve success never returns; record on entry.
-            let addr = regs.rdi as usize;
-            if addr == 0 {
-                return Ok(());
-            }
-            let path = read_path(addr)?;
-            if !path.is_empty() {
-                report.record_path_with_access(PathBuf::from(path), TraceAccess::EXEC);
-            }
+    // x86_64 syscall entry sets pt_regs.ax = -ENOSYS before the enter stop
+    // (PUSH_AND_CLEAR_REGS rax=$-ENOSYS). The exit stop then has the real
+    // return value. A cloned thread's first syscall-stop is sometimes that
+    // creating syscall's exit, which inverts a per-thread toggle forever:
+    // the worker openat is logged on the stop we think is entry, and the
+    // following stop (the next syscall's entry, rax == -ENOSYS) is treated
+    // as a failed exit, so the path never reaches the manifest.
+    let ret = regs.rax as i64;
+    let entering = ret == -(libc::ENOSYS as i64);
+    debug!(
+        "ptrace: syscall stop pid={} entering={} syscall={} rax={}",
+        pid.as_raw(),
+        entering,
+        syscall_name(syscall),
+        ret
+    );
+
+    if entering && syscall == libc::SYS_execve {
+        // execve success never returns; record on entry.
+        let addr = regs.rdi as usize;
+        if addr == 0 {
             return Ok(());
         }
+        let path = read_path(addr)?;
+        if !path.is_empty() {
+            report.record_path_with_access(PathBuf::from(path), TraceAccess::EXEC);
+        }
+        return Ok(());
+    }
 
-        let (dirfd, addr, is_at, access) = match syscall {
-            libc::SYS_open => (
-                libc::AT_FDCWD as i64,
-                regs.rdi as usize,
-                false,
-                TraceAccess::OPEN,
-            ),
-            libc::SYS_stat => (
-                libc::AT_FDCWD as i64,
-                regs.rdi as usize,
-                false,
-                TraceAccess::STAT,
-            ),
-            libc::SYS_lstat => (
-                libc::AT_FDCWD as i64,
-                regs.rdi as usize,
-                false,
-                TraceAccess::LINK,
-            ),
-            libc::SYS_readlink => (
-                libc::AT_FDCWD as i64,
-                regs.rdi as usize,
-                false,
-                TraceAccess::LINK,
-            ),
+    let (dirfd, addr, is_at, access) = match syscall {
+        libc::SYS_open => (
+            libc::AT_FDCWD as i64,
+            regs.rdi as usize,
+            false,
+            TraceAccess::OPEN,
+        ),
+        libc::SYS_stat => (
+            libc::AT_FDCWD as i64,
+            regs.rdi as usize,
+            false,
+            TraceAccess::STAT,
+        ),
+        libc::SYS_lstat => (
+            libc::AT_FDCWD as i64,
+            regs.rdi as usize,
+            false,
+            TraceAccess::LINK,
+        ),
+        libc::SYS_readlink => (
+            libc::AT_FDCWD as i64,
+            regs.rdi as usize,
+            false,
+            TraceAccess::LINK,
+        ),
 
-            libc::SYS_openat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
-            libc::SYS_newfstatat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
-            libc::SYS_readlinkat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::LINK),
+        libc::SYS_openat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
+        libc::SYS_newfstatat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
+        libc::SYS_readlinkat => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::LINK),
 
-            SYS_STATX => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
-            SYS_OPENAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
-            SYS_FACCESSAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
+        SYS_STATX => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
+        SYS_OPENAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::OPEN),
+        SYS_FACCESSAT2 => (regs.rdi as i64, regs.rsi as usize, true, TraceAccess::STAT),
 
-            _ => (0, 0, false, TraceAccess::empty()),
-        };
+        _ => (0, 0, false, TraceAccess::empty()),
+    };
 
+    if entering {
         if addr == 0 {
             return Ok(());
         }
@@ -595,9 +600,10 @@ fn handle_syscall_regs(
         return Ok(());
     }
 
-    // exit: only record on success
+    // Exit stop. `ret` is the syscall result. Prefer the path captured on the
+    // matching enter; if this task's first stop is already an exit (clone),
+    // recover the path from the argument registers, which are still intact.
     if let Some(p) = pending.remove(&pid) {
-        let ret = regs.rax as i64;
         if ret >= 0 {
             debug!(
                 "ptrace: record pid={} path={} access={:?}",
@@ -607,14 +613,46 @@ fn handle_syscall_regs(
             );
             report.record_path_with_access(PathBuf::from(p.path), p.access);
         }
+        return Ok(());
     }
+    if ret < 0 || addr == 0 {
+        return Ok(());
+    }
+    let path = read_path(addr)?;
+    if path.is_empty() {
+        return Ok(());
+    }
+    debug!(
+        "ptrace: path pid={} syscall={} dirfd={} is_at={} path={}",
+        pid.as_raw(),
+        syscall_name(syscall),
+        dirfd,
+        is_at,
+        path
+    );
+    if is_at && !should_record_at_path(dirfd, &path) {
+        debug!(
+            "ptrace: skip path pid={} syscall={} dirfd={} path={}",
+            pid.as_raw(),
+            syscall_name(syscall),
+            dirfd,
+            path
+        );
+        return Ok(());
+    }
+    debug!(
+        "ptrace: record pid={} path={} access={:?}",
+        pid.as_raw(),
+        path,
+        access
+    );
+    report.record_path_with_access(PathBuf::from(path), access);
     Ok(())
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn handle_syscall(
     _pid: Pid,
-    _entering: bool,
     _pending: &mut HashMap<Pid, PendingSyscall>,
     _report: &mut TraceReport,
 ) -> Result<(), TraceError> {
@@ -708,6 +746,11 @@ mod tests {
         regs
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn mark_syscall_enter(regs: &mut libc::user_regs_struct) {
+        regs.rax = (-(libc::ENOSYS as i64)) as u64;
+    }
+
     #[test]
     fn ptrace_default_options_enable_traceclone() {
         let opts = ptrace_default_options();
@@ -748,22 +791,16 @@ mod tests {
         let mut regs = regs_for(SYS_STATX);
         regs.rdi = libc::AT_FDCWD as u64;
         regs.rsi = 0x1000;
-        handle_syscall_regs(
-            pid,
-            true,
-            SYS_STATX,
-            &regs,
-            &mut pending,
-            &mut report,
-            |_| Ok("encodings/__init__.py".to_string()),
-        )
+        mark_syscall_enter(&mut regs);
+        handle_syscall_regs(pid, SYS_STATX, &regs, &mut pending, &mut report, |_| {
+            Ok("encodings/__init__.py".to_string())
+        })
         .unwrap();
 
         let mut regs_exit = regs_for(SYS_STATX);
         regs_exit.rax = (-libc::ENOENT) as u64;
         handle_syscall_regs(
             pid,
-            false,
             SYS_STATX,
             &regs_exit,
             &mut pending,
@@ -776,22 +813,16 @@ mod tests {
         let mut regs = regs_for(SYS_STATX);
         regs.rdi = libc::AT_FDCWD as u64;
         regs.rsi = 0x2000;
-        handle_syscall_regs(
-            pid,
-            true,
-            SYS_STATX,
-            &regs,
-            &mut pending,
-            &mut report,
-            |_| Ok("encodings/__init__.py".to_string()),
-        )
+        mark_syscall_enter(&mut regs);
+        handle_syscall_regs(pid, SYS_STATX, &regs, &mut pending, &mut report, |_| {
+            Ok("encodings/__init__.py".to_string())
+        })
         .unwrap();
 
         let mut regs_exit = regs_for(SYS_STATX);
         regs_exit.rax = 0;
         handle_syscall_regs(
             pid,
-            false,
             SYS_STATX,
             &regs_exit,
             &mut pending,
@@ -802,6 +833,48 @@ mod tests {
         assert!(report
             .files
             .contains_key(Path::new("encodings/__init__.py")));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn thread_openat_exit_records_without_a_prior_enter_stop() {
+        // CI smoke: worker openat("/etc/hosts") is a successful exit (fd >= 0)
+        // with a 32-bit AT_FDCWD in rdi. An inverted enter/exit toggle treated
+        // that stop as an entry and dropped the file. rax >= 0 must record it
+        // even when no enter stop stored a pending path.
+        let pid = Pid::from_raw(12713);
+        let mut pending = HashMap::new();
+        let mut report = TraceReport::default();
+        let mut regs = regs_for(libc::SYS_openat);
+        regs.rdi = 4294967196; // 0xFFFFFF9C, AT_FDCWD truncated to 32 bits
+        regs.rsi = 0x1000;
+        regs.rax = 3;
+        handle_syscall_regs(
+            pid,
+            libc::SYS_openat,
+            &regs,
+            &mut pending,
+            &mut report,
+            |_| Ok("/etc/hosts".to_string()),
+        )
+        .unwrap();
+        assert!(report.files.contains_key(Path::new("/etc/hosts")));
+
+        let mut enter = regs_for(libc::SYS_openat);
+        enter.rdi = regs.rdi;
+        enter.rsi = regs.rsi;
+        mark_syscall_enter(&mut enter);
+        let mut ignored = TraceReport::default();
+        handle_syscall_regs(
+            pid,
+            libc::SYS_openat,
+            &enter,
+            &mut pending,
+            &mut ignored,
+            |_| Ok("/etc/hosts".to_string()),
+        )
+        .unwrap();
+        assert!(ignored.files.is_empty());
     }
 
     #[test]
@@ -833,36 +906,25 @@ mod tests {
         let mut regs_a = regs_for(SYS_STATX);
         regs_a.rdi = libc::AT_FDCWD as u64;
         regs_a.rsi = 0x1000;
-        handle_syscall_regs(
-            pid_a,
-            true,
-            SYS_STATX,
-            &regs_a,
-            &mut pending,
-            &mut report,
-            |_| Ok("a.py".to_string()),
-        )
+        mark_syscall_enter(&mut regs_a);
+        handle_syscall_regs(pid_a, SYS_STATX, &regs_a, &mut pending, &mut report, |_| {
+            Ok("a.py".to_string())
+        })
         .unwrap();
 
         let mut regs_b = regs_for(SYS_STATX);
         regs_b.rdi = libc::AT_FDCWD as u64;
         regs_b.rsi = 0x2000;
-        handle_syscall_regs(
-            pid_b,
-            true,
-            SYS_STATX,
-            &regs_b,
-            &mut pending,
-            &mut report,
-            |_| Ok("b.py".to_string()),
-        )
+        mark_syscall_enter(&mut regs_b);
+        handle_syscall_regs(pid_b, SYS_STATX, &regs_b, &mut pending, &mut report, |_| {
+            Ok("b.py".to_string())
+        })
         .unwrap();
 
         let mut regs_exit_a = regs_for(SYS_STATX);
         regs_exit_a.rax = 0;
         handle_syscall_regs(
             pid_a,
-            false,
             SYS_STATX,
             &regs_exit_a,
             &mut pending,
@@ -877,7 +939,6 @@ mod tests {
         regs_exit_b.rax = 0;
         handle_syscall_regs(
             pid_b,
-            false,
             SYS_STATX,
             &regs_exit_b,
             &mut pending,
