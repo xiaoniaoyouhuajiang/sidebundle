@@ -2,6 +2,8 @@
 //!
 //! Verification (2026-10-28): curl-host failed on centos:7 / ubuntu 18.04 because the CA bundle
 //! stayed on the host absolute path, and tesseract shipped tessdata but still read the image path.
+//! ImageMagick 6 loads coders through libltdl (`.la` next to the module) and reads
+//! `delegates.xml` from `MAGICK_CONFIGURE_PATH`. Trace of `-version` does not open that tree.
 //! Values use `${SIDEBUNDLE_ROOT}` so the launcher can expand them for any mount point.
 
 use std::fs;
@@ -77,6 +79,62 @@ pub fn inject_portable_data(
                 );
             }
         }
+        if origin_needs_magick(closure, origin) {
+            inject_magick_config(closure, origin, root)?;
+        }
+    }
+    Ok(())
+}
+
+fn inject_magick_config(
+    closure: &mut DependencyClosure,
+    origin: &Origin,
+    root: &Path,
+) -> Result<()> {
+    let configs = magick_config_rels(root);
+    for rel in &configs {
+        let source = root.join(rel);
+        add_tree(closure, &source, rel).with_context(|| {
+            format!(
+                "failed to bundle ImageMagick config {} for {origin:?}",
+                source.display()
+            )
+        })?;
+    }
+    let configure = configs
+        .iter()
+        .find(|rel| root.join(rel).join("delegates.xml").is_file())
+        .cloned()
+        .or_else(|| configs.first().cloned());
+    let coders = find_magick_module_rel(root, "coders");
+    let filters = find_magick_module_rel(root, "filters");
+    if configure.is_none() && coders.is_none() && filters.is_none() {
+        return Ok(());
+    }
+    let meta = closure.metadata.entry(origin.clone()).or_default();
+    if let Some(rel) = configure {
+        meta.env_defaults
+            .entry("MAGICK_CONFIGURE_PATH".into())
+            .or_insert_with(|| portable_value(&rel));
+        info!(
+            "portable data: MAGICK_CONFIGURE_PATH for {origin:?} -> ${{SIDEBUNDLE_ROOT}}/payload/{rel}"
+        );
+    }
+    if let Some(rel) = coders {
+        meta.env_defaults
+            .entry("MAGICK_CODER_MODULE_PATH".into())
+            .or_insert_with(|| portable_value(&rel));
+        info!(
+            "portable data: MAGICK_CODER_MODULE_PATH for {origin:?} -> ${{SIDEBUNDLE_ROOT}}/payload/{rel}"
+        );
+    }
+    if let Some(rel) = filters {
+        meta.env_defaults
+            .entry("MAGICK_FILTER_MODULE_PATH".into())
+            .or_insert_with(|| portable_value(&rel));
+        info!(
+            "portable data: MAGICK_FILTER_MODULE_PATH for {origin:?} -> ${{SIDEBUNDLE_ROOT}}/payload/{rel}"
+        );
     }
     Ok(())
 }
@@ -106,6 +164,41 @@ fn origin_needs_tessdata(closure: &DependencyClosure, origin: &Origin) -> bool {
         .iter()
         .filter(|plan| plan.origin() == origin)
         .any(|plan| is_tesseract_name(plan.display_name()) || plan_is_tesseract_binary(plan))
+}
+
+fn origin_needs_magick(closure: &DependencyClosure, origin: &Origin) -> bool {
+    closure
+        .entry_plans
+        .iter()
+        .filter(|plan| plan.origin() == origin)
+        .any(plan_is_magick)
+}
+
+fn plan_is_magick(plan: &EntryBundlePlan) -> bool {
+    if is_magick_tool_name(plan.display_name()) {
+        return true;
+    }
+    match plan {
+        EntryBundlePlan::Binary(plan) => {
+            path_is_magick(&plan.binary_source) || path_is_magick(&plan.binary_destination)
+        }
+        EntryBundlePlan::Script(plan) => {
+            path_is_magick(&plan.script_source) || path_is_magick(&plan.script_destination)
+        }
+    }
+}
+
+fn path_is_magick(path: &Path) -> bool {
+    let name = file_name(path);
+    is_magick_tool_name(&name) || path.to_string_lossy().contains("ImageMagick")
+}
+
+fn is_magick_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "convert"
+        || lower == "magick"
+        || lower.starts_with("convert-im")
+        || lower.starts_with("magick-")
 }
 
 fn plan_links_ssl(plan: &EntryBundlePlan) -> bool {
@@ -225,6 +318,77 @@ fn dir_has_traineddata(dir: &Path) -> bool {
                 .unwrap_or(false)
         })
     })
+}
+
+fn magick_config_rels(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for rel in ["etc/ImageMagick-6", "etc/ImageMagick-7"] {
+        if root.join(rel).is_dir() {
+            found.push(rel.to_string());
+        }
+    }
+    let mut extra = Vec::new();
+    for base in ["usr/lib", "usr/lib64", "usr/local/lib", "lib", "lib64"] {
+        walk_magick_dirs(&root.join(base), 0, &mut |dir| {
+            let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if !name.starts_with("config-Q") || !dir.join("delegates.xml").is_file() {
+                return;
+            }
+            if !dir.to_string_lossy().contains("ImageMagick") {
+                return;
+            }
+            if let Ok(rel) = dir.strip_prefix(root) {
+                extra.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        });
+    }
+    extra.sort();
+    extra.dedup();
+    found.extend(extra);
+    found
+}
+
+fn find_magick_module_rel(root: &Path, kind: &str) -> Option<String> {
+    let mut preferred = None;
+    let mut fallback = None;
+    for base in ["usr/lib", "usr/lib64", "usr/local/lib", "lib", "lib64"] {
+        walk_magick_dirs(&root.join(base), 0, &mut |dir| {
+            if dir.file_name().and_then(|name| name.to_str()) != Some(kind) {
+                return;
+            }
+            if !dir.to_string_lossy().contains("ImageMagick") {
+                return;
+            }
+            let Ok(rel) = dir.strip_prefix(root) else {
+                return;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if dir.join("png.la").is_file() || dir.join("png.so").is_file() {
+                if preferred.is_none() {
+                    preferred = Some(rel);
+                }
+            } else if fallback.is_none() {
+                fallback = Some(rel);
+            }
+        });
+    }
+    preferred.or(fallback)
+}
+
+fn walk_magick_dirs(dir: &Path, depth: usize, visit: &mut dyn FnMut(&Path)) {
+    if depth > 8 || !dir.is_dir() {
+        return;
+    }
+    visit(dir);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            walk_magick_dirs(&path, depth + 1, visit);
+        }
+    }
 }
 
 fn add_file(closure: &mut DependencyClosure, source: &Path, rel: &str) -> Result<()> {
@@ -423,5 +587,72 @@ mod tests {
             .get("SSL_CERT_FILE")
             .unwrap()
             .ends_with("etc/pki/tls/certs/ca-bundle.crt"));
+    }
+
+    #[test]
+    fn imagemagick_copies_config_and_sets_module_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc/ImageMagick-6");
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(etc.join("delegates.xml"), b"<delegatemap/>").unwrap();
+        fs::write(etc.join("policy.xml"), b"<policymap/>").unwrap();
+        let coder = root
+            .path()
+            .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders");
+        fs::create_dir_all(&coder).unwrap();
+        fs::write(coder.join("png.la"), b"dlname='png.so'\n").unwrap();
+        fs::write(coder.join("png.so"), b"png").unwrap();
+        let filter = root
+            .path()
+            .join("usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/filters");
+        fs::create_dir_all(&filter).unwrap();
+        fs::write(filter.join("analyze.la"), b"dlname='analyze.so'\n").unwrap();
+
+        let origin = Origin::Image("im".into());
+        let mut closure =
+            DependencyClosure::default().add_entry(binary_plan("convert-im6.q16", origin.clone()));
+        inject_portable_data(&mut closure, &[(origin.clone(), root.path().to_path_buf())]).unwrap();
+
+        assert!(closure.files.iter().any(|file| {
+            file.destination == Path::new("payload/etc/ImageMagick-6/delegates.xml")
+        }));
+        assert!(closure
+            .files
+            .iter()
+            .any(|file| file.destination == Path::new("payload/etc/ImageMagick-6/policy.xml")));
+        let meta = closure.metadata.get(&origin).unwrap();
+        assert_eq!(
+            meta.env_defaults
+                .get("MAGICK_CONFIGURE_PATH")
+                .map(String::as_str),
+            Some("${SIDEBUNDLE_ROOT}/payload/etc/ImageMagick-6")
+        );
+        assert_eq!(
+            meta.env_defaults
+                .get("MAGICK_CODER_MODULE_PATH")
+                .map(String::as_str),
+            Some("${SIDEBUNDLE_ROOT}/payload/usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders")
+        );
+        assert_eq!(
+            meta.env_defaults
+                .get("MAGICK_FILTER_MODULE_PATH")
+                .map(String::as_str),
+            Some("${SIDEBUNDLE_ROOT}/payload/usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/filters")
+        );
+    }
+
+    #[test]
+    fn convert_display_name_triggers_magick_config() {
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc/ImageMagick-6");
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(etc.join("delegates.xml"), b"<delegatemap/>").unwrap();
+        let origin = Origin::Image("im".into());
+        let mut closure =
+            DependencyClosure::default().add_entry(binary_plan("convert", origin.clone()));
+        inject_portable_data(&mut closure, &[(origin.clone(), root.path().to_path_buf())]).unwrap();
+        assert!(closure.files.iter().any(|file| {
+            file.destination == Path::new("payload/etc/ImageMagick-6/delegates.xml")
+        }));
     }
 }

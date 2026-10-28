@@ -22,6 +22,7 @@ const PORTABLE_PATH_KEYS: &[&str] = &[
     "GIT_TEMPLATE_DIR",
     "MAGICK_CONFIGURE_PATH",
     "MAGICK_CODER_MODULE_PATH",
+    "MAGICK_FILTER_MODULE_PATH",
 ];
 
 const CA_REL_CANDIDATES: &[&str] = &[
@@ -486,6 +487,36 @@ fn repair_portable_prefixes(
             env_map.insert("TESSDATA_PREFIX".into(), dir.to_string_lossy().into_owned());
         }
     }
+    if !protected.contains("MAGICK_CONFIGURE_PATH")
+        && !configured_path_exists(env_map.get("MAGICK_CONFIGURE_PATH"))
+    {
+        if let Some(dir) = find_magick_configure_dir(&payload) {
+            env_map.insert(
+                "MAGICK_CONFIGURE_PATH".into(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
+    }
+    if !protected.contains("MAGICK_CODER_MODULE_PATH")
+        && !configured_path_exists(env_map.get("MAGICK_CODER_MODULE_PATH"))
+    {
+        if let Some(dir) = find_magick_module_dir(&payload, "coders") {
+            env_map.insert(
+                "MAGICK_CODER_MODULE_PATH".into(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
+    }
+    if !protected.contains("MAGICK_FILTER_MODULE_PATH")
+        && !configured_path_exists(env_map.get("MAGICK_FILTER_MODULE_PATH"))
+    {
+        if let Some(dir) = find_magick_module_dir(&payload, "filters") {
+            env_map.insert(
+                "MAGICK_FILTER_MODULE_PATH".into(),
+                dir.to_string_lossy().into_owned(),
+            );
+        }
+    }
 }
 
 fn configured_path_exists(value: Option<&String>) -> bool {
@@ -525,6 +556,78 @@ fn find_tessdata_dir(payload: &Path) -> Option<PathBuf> {
         }
     }
     fallback
+}
+
+fn find_magick_configure_dir(payload: &Path) -> Option<PathBuf> {
+    for rel in ["etc/ImageMagick-6", "etc/ImageMagick-7"] {
+        let dir = payload.join(rel);
+        if dir.join("delegates.xml").is_file() {
+            return Some(dir);
+        }
+    }
+    let mut found = None;
+    walk_magick_dirs(payload, &mut |dir| {
+        if found.is_some() {
+            return;
+        }
+        let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if name.starts_with("config-Q")
+            && dir.join("delegates.xml").is_file()
+            && dir.to_string_lossy().contains("ImageMagick")
+        {
+            found = Some(dir.to_path_buf());
+        }
+    });
+    found
+}
+
+fn find_magick_module_dir(payload: &Path, kind: &str) -> Option<PathBuf> {
+    let mut preferred = None;
+    let mut fallback = None;
+    walk_magick_dirs(payload, &mut |dir| {
+        if dir.file_name().and_then(|name| name.to_str()) != Some(kind) {
+            return;
+        }
+        if !dir.to_string_lossy().contains("ImageMagick") {
+            return;
+        }
+        if dir.join("png.la").is_file() || dir.join("png.so").is_file() {
+            if preferred.is_none() {
+                preferred = Some(dir.to_path_buf());
+            }
+        } else if fallback.is_none() {
+            fallback = Some(dir.to_path_buf());
+        }
+    });
+    preferred.or(fallback)
+}
+
+fn walk_magick_dirs(payload: &Path, visit: &mut dyn FnMut(&Path)) {
+    for base in [
+        "etc",
+        "usr/lib",
+        "usr/lib64",
+        "usr/local/lib",
+        "lib",
+        "lib64",
+    ] {
+        walk_dir_limited(&payload.join(base), 0, visit);
+    }
+}
+
+fn walk_dir_limited(dir: &Path, depth: usize, visit: &mut dyn FnMut(&Path)) {
+    if depth > 8 || !dir.is_dir() {
+        return;
+    }
+    visit(dir);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            walk_dir_limited(&entry.path(), depth + 1, visit);
+        }
+    }
 }
 
 fn dir_has_traineddata(dir: &Path) -> bool {
@@ -1255,5 +1358,51 @@ mod tests {
             "/etc/ssl/certs/ca-certificates.crt"
         );
         assert!(!merged.contains_key("TESSDATA_PREFIX"));
+    }
+
+    #[test]
+    fn repairs_missing_imagemagick_paths_from_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("payload/etc/ImageMagick-6");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("delegates.xml"), b"<delegatemap/>").unwrap();
+        let coder = root
+            .path()
+            .join("payload/usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/coders");
+        std::fs::create_dir_all(&coder).unwrap();
+        std::fs::write(coder.join("png.la"), b"dlname='png.so'\n").unwrap();
+        let filter = root
+            .path()
+            .join("payload/usr/lib/x86_64-linux-gnu/ImageMagick-6.9.11/modules-Q16/filters");
+        std::fs::create_dir_all(&filter).unwrap();
+        std::fs::write(filter.join("analyze.so"), b"filter").unwrap();
+
+        let merged = assemble_env(caller(&[]), None, root.path(), RunMode::Host, &[]);
+        assert_eq!(
+            merged.get("MAGICK_CONFIGURE_PATH").map(String::as_str),
+            Some(etc.to_str().unwrap())
+        );
+        assert_eq!(
+            merged.get("MAGICK_CODER_MODULE_PATH").map(String::as_str),
+            Some(coder.to_str().unwrap())
+        );
+        assert_eq!(
+            merged.get("MAGICK_FILTER_MODULE_PATH").map(String::as_str),
+            Some(filter.to_str().unwrap())
+        );
+
+        let protected = assemble_env(
+            caller(&[("MAGICK_CODER_MODULE_PATH", "/opt/custom/coders")]),
+            None,
+            root.path(),
+            RunMode::Host,
+            &[],
+        );
+        assert_eq!(
+            protected
+                .get("MAGICK_CODER_MODULE_PATH")
+                .map(String::as_str),
+            Some("/opt/custom/coders")
+        );
     }
 }
